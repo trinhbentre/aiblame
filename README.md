@@ -181,7 +181,7 @@ aiblame hook install                    # Assisted-by: Claude Code
 aiblame hook install --style co-authored-by
 ```
 
-The hook is a 40-line POSIX shell script (`aiblame hook print`). It fires
+The hook is a ~45-line POSIX shell script (`aiblame hook print`). It fires
 only when the commit is made from inside an agent session, detected via the
 variables agents set for their subprocesses: `CLAUDECODE` (Claude Code),
 `CODEX_SANDBOX*` (Codex), `CURSOR_AGENT` (Cursor), `GEMINI_CLI`, `OPENCODE`.

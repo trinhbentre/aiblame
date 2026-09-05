@@ -3,6 +3,8 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/trinhbentre/aiblame/internal/attrib"
 	"github.com/trinhbentre/aiblame/internal/config"
@@ -270,8 +273,10 @@ func isTTY(w io.Writer) bool {
 	return err == nil && st.Mode()&os.ModeCharDevice != 0
 }
 
-// openTarget resolves PATH / URL / owner/repo into an opened repository.
-func openTarget(ctx context.Context, target string, env Env, quiet bool) (*gitx.Runner, error) {
+// openTarget resolves PATH / URL / owner/repo into an opened repository. The
+// returned warnings (e.g. "using cached history") belong in the report so
+// that JSON consumers see them too.
+func openTarget(ctx context.Context, target string, env Env, quiet bool) (*gitx.Runner, []string, error) {
 	if target == "" {
 		target = "."
 	}
@@ -281,26 +286,34 @@ func openTarget(ctx context.Context, target string, env Env, quiet bool) (*gitx.
 		}
 	}
 	if st, err := os.Stat(target); err == nil && st.IsDir() {
-		return gitx.Open(ctx, target)
+		r, err := gitx.Open(ctx, target)
+		return r, nil, err
 	}
 	url, ok := remoteURL(target)
 	if !ok {
 		if _, err := os.Stat(target); err != nil {
-			return nil, fmt.Errorf("%s: not a directory, URL or owner/repo", target)
+			return nil, nil, fmt.Errorf("%s: not a directory, URL or owner/repo", target)
 		}
-		return gitx.Open(ctx, filepath.Dir(target))
+		r, err := gitx.Open(ctx, filepath.Dir(target))
+		return r, nil, err
 	}
-	dir, err := cloneToCache(ctx, url, env, quiet)
+	dir, warns, err := cloneToCache(ctx, url, env, quiet)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return gitx.Open(ctx, dir)
+	r, err := gitx.Open(ctx, dir)
+	return r, warns, err
 }
 
-// remoteURL recognises git URLs and GitHub owner/repo shorthand.
+// remoteURL recognises git URLs and GitHub owner/repo shorthand. Hosts that
+// start with '-' are rejected so nothing can reach git or ssh as an option.
 func remoteURL(s string) (string, bool) {
 	for _, p := range []string{"https://", "http://", "git@", "ssh://", "git://"} {
 		if strings.HasPrefix(s, p) {
+			rest := strings.TrimPrefix(s, p)
+			if rest == "" || strings.HasPrefix(rest, "-") || strings.ContainsAny(rest, " \t\n") {
+				return "", false
+			}
 			return s, true
 		}
 	}
@@ -311,7 +324,10 @@ func remoteURL(s string) (string, bool) {
 	return "", false
 }
 
-func cloneToCache(ctx context.Context, url string, env Env, quiet bool) (string, error) {
+// cloneToCache clones url into the user cache (or refreshes an existing
+// clone). Refresh problems do not abort the run; they are returned as
+// warnings so the caller can surface them in the report.
+func cloneToCache(ctx context.Context, url string, env Env, quiet bool) (string, []string, error) {
 	base := env.Getenv("AIBLAME_CACHE_DIR")
 	if base == "" {
 		c, err := os.UserCacheDir()
@@ -320,38 +336,103 @@ func cloneToCache(ctx context.Context, url string, env Env, quiet bool) (string,
 		}
 		base = filepath.Join(c, "aiblame", "repos")
 	}
-	name := strings.NewReplacer("https://", "", "http://", "", "ssh://", "", "git://", "", "git@", "", ":", "_", "/", "_", ".git", "").Replace(url)
-	name = strings.Trim(name, "_")
-	dir := filepath.Join(base, name)
+	dir := filepath.Join(base, cacheName(url))
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		return "", nil, err
+	}
+	// Serialise concurrent invocations against the same cache entry.
+	unlock, err := lockPath(ctx, dir+".lock")
+	if err != nil {
+		return "", nil, err
+	}
+	defer unlock()
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
 		if !quiet {
 			fmt.Fprintf(env.Stderr, "updating cached clone %s\n", dir)
 		}
 		r := &gitx.Runner{Dir: dir}
 		if _, err := r.Run(ctx, "fetch", "--quiet", "--prune", "origin"); err != nil {
-			fmt.Fprintf(env.Stderr, "warning: fetch failed (%v); using cached history\n", err)
-			return dir, nil
+			return dir, []string{fmt.Sprintf("fetch of %s failed (%v); results use the cached history in %s", url, shortErr(err), dir)}, nil
 		}
 		if out, err := r.Run(ctx, "symbolic-ref", "-q", "refs/remotes/origin/HEAD"); err == nil {
 			ref := strings.TrimSpace(string(out))
 			// The cache is a throwaway mirror; move the checkout to the remote head.
 			if _, err := r.Run(ctx, "reset", "--hard", "--quiet", ref); err != nil {
-				fmt.Fprintf(env.Stderr, "warning: could not fast-forward cached clone: %v\n", err)
+				return dir, []string{fmt.Sprintf("could not move cached clone to %s (%v); results may be stale", ref, shortErr(err))}, nil
 			}
 		}
-		return dir, nil
-	}
-	if err := os.MkdirAll(base, 0o755); err != nil {
-		return "", err
+		return dir, nil, nil
 	}
 	if !quiet {
 		fmt.Fprintf(env.Stderr, "cloning %s into %s …\n", url, dir)
 	}
 	r := &gitx.Runner{Dir: base}
-	if _, err := r.Run(ctx, "clone", "--quiet", url, dir); err != nil {
-		return "", err
+	// "--" keeps a URL that starts with '-' from being read as an option, and
+	// the ext:: transport (arbitrary command execution) is disabled outright.
+	if _, err := r.Run(ctx, "-c", "protocol.ext.allow=never", "clone", "--quiet", "--", url, dir); err != nil {
+		return "", nil, err
 	}
-	return dir, nil
+	return dir, nil, nil
+}
+
+// cacheName turns a URL into a single safe path segment: a readable slug
+// plus a short hash so distinct URLs never collide or escape the cache dir.
+func cacheName(url string) string {
+	slug := strings.NewReplacer("https://", "", "http://", "", "ssh://", "", "git://", "", "git@", "").Replace(url)
+	slug = strings.TrimSuffix(slug, ".git")
+	var b strings.Builder
+	for _, r := range slug {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	s := strings.Trim(b.String(), "_.")
+	if len(s) > 80 {
+		s = s[:80]
+	}
+	sum := sha256.Sum256([]byte(url))
+	return s + "-" + hex.EncodeToString(sum[:4])
+}
+
+// lockPath acquires an exclusive lock file with O_EXCL, waiting up to a
+// minute for a concurrent holder and reclaiming locks older than 15 minutes
+// (a crashed process). It works the same on every OS, unlike flock.
+func lockPath(ctx context.Context, path string) (func(), error) {
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			fmt.Fprintf(f, "%d\n", os.Getpid())
+			f.Close()
+			return func() { os.Remove(path) }, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+		if st, serr := os.Stat(path); serr == nil && time.Since(st.ModTime()) > 15*time.Minute {
+			os.Remove(path)
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("another aiblame is updating %s (remove %s if that is not the case)", strings.TrimSuffix(path, ".lock"), path)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+func shortErr(err error) string {
+	s := err.Error()
+	if i := strings.IndexByte(s, '\n'); i > 0 {
+		s = s[:i]
+	}
+	return s
 }
 
 // buildAnalyzer wires config + flags into a stats.Analyzer.

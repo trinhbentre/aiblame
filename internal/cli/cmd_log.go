@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/trinhbentre/aiblame/internal/attrib"
+	"github.com/trinhbentre/aiblame/internal/render"
 )
 
 const logHelp = `Usage: aiblame log [PATH] [flags]
@@ -87,9 +88,12 @@ func cmdLog(ctx context.Context, args []string, env Env) int {
 	if len(pos) == 1 {
 		target = pos[0]
 	}
-	r, err := openTarget(ctx, target, env, true)
+	r, warns, err := openTarget(ctx, target, env, true)
 	if err != nil {
 		return fail(env, err)
+	}
+	for _, w := range warns {
+		fmt.Fprintln(env.Stderr, "warning: "+w)
 	}
 	an, _, err := buildAnalyzer(&c, r, env, false)
 	if err != nil {
@@ -157,14 +161,14 @@ func cmdLog(ctx context.Context, args []string, env Env) int {
 		if color {
 			tag = colorKind(e.Kind) + tag + "\x1b[0m"
 		}
-		agents := strings.Join(e.Agents, ",")
+		agents := render.Sanitize(strings.Join(e.Agents, ","))
 		if agents == "" {
 			agents = "-"
 		}
-		fmt.Fprintf(env.Stdout, "%s  %s  %s  %-14s  +%d/-%d  %s\n", e.Hash[:7], e.Date, tag, truncate(agents, 14), e.Added, e.Deleted, e.Subject)
+		fmt.Fprintf(env.Stdout, "%s  %s  %s  %-14s  +%d/-%d  %s\n", e.Hash[:7], e.Date, tag, truncate(agents, 14), e.Added, e.Deleted, render.Sanitize(e.Subject))
 		if *evidence {
 			for _, ev := range e.Evidence {
-				fmt.Fprintf(env.Stdout, "         └ %s: %s\n", ev.Source, ev.Value)
+				fmt.Fprintf(env.Stdout, "         └ %s: %s\n", ev.Source, render.Sanitize(ev.Value))
 			}
 		}
 	}

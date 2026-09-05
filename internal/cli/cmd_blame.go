@@ -144,7 +144,7 @@ func cmdBlame(ctx context.Context, args []string, env Env) int {
 			width = 5
 		}
 		for _, l := range out {
-			agent := l.Agent
+			agent := render.Sanitize(l.Agent)
 			if agent == "" {
 				agent = "-"
 			}
@@ -152,7 +152,7 @@ func cmdBlame(ctx context.Context, args []string, env Env) int {
 			if color {
 				prefix = colorKind(l.Kind) + prefix + "\x1b[0m"
 			}
-			fmt.Fprintf(env.Stdout, "%s | %s\n", prefix, l.Content)
+			fmt.Fprintf(env.Stdout, "%s | %s\n", prefix, render.Sanitize(l.Content))
 		}
 		fmt.Fprintln(env.Stdout)
 	}

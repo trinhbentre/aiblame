@@ -184,7 +184,7 @@ fi
 	b.WriteString(`if command -v git >/dev/null 2>&1 && git interpret-trailers --in-place --if-exists addIfDifferent --trailer "$trailer" "$msgfile" 2>/dev/null; then
   exit 0
 fi
-printf '\n%s\n' "$trailer" >> "$msgfile"
+printf '\n%s\n' "$trailer" >> "$msgfile" || echo "aiblame-hook: could not append trailer to $msgfile" >&2
 exit 0
 `)
 	return b.String()

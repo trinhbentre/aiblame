@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -53,20 +55,23 @@ func (r *Runner) Blame(ctx context.Context, path string, opts BlameOptions) (*Bl
 	if err != nil {
 		return nil, err
 	}
-	res := ParseBlamePorcelain(out, opts.Content)
+	res, err := ParseBlamePorcelain(out, opts.Content)
+	if err != nil {
+		return nil, fmt.Errorf("blame %s: %w", path, err)
+	}
 	res.Path = path
 	return res, nil
 }
 
 // ParseBlamePorcelain parses `git blame --porcelain` output.
 //
-// Each line group starts with "<sha> <orig> <final> [<n>]"; header key/value
-// lines follow on first occurrence of a commit; the content line starts with
-// a tab.
-func ParseBlamePorcelain(out []byte, keepContent bool) *BlameResult {
+// Each line group starts with "<hash> <orig> <final> [<n>]" (40-hex SHA-1 or
+// 64-hex SHA-256); header key/value lines follow on first occurrence of a
+// commit; the content line starts with a tab.
+func ParseBlamePorcelain(out []byte, keepContent bool) (*BlameResult, error) {
 	res := &BlameResult{Counts: map[string]int{}}
 	sc := bufio.NewScanner(bytes.NewReader(out))
-	sc.Buffer(make([]byte, 1024*1024), 64*1024*1024)
+	sc.Buffer(make([]byte, 1024*1024), 256*1024*1024)
 	var cur string
 	var curLine int
 	expectContent := false
@@ -91,28 +96,40 @@ func ParseBlamePorcelain(out []byte, keepContent bool) *BlameResult {
 			expectContent = true
 		}
 	}
-	return res
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("reading blame output: %w", err)
+	}
+	if expectContent {
+		return nil, errors.New("truncated blame output: header without content line")
+	}
+	return res, nil
 }
 
+// parseBlameHeader recognises "<hash> <orig> <final> [<n>]" where hash is a
+// 40-hex SHA-1 or 64-hex SHA-256 object name.
 func parseBlameHeader(line string) (hash string, final int, ok bool) {
-	if len(line) < 44 || line[40] != ' ' {
+	sp := strings.IndexByte(line, ' ')
+	if sp != 40 && sp != 64 {
 		return "", 0, false
 	}
-	for i := 0; i < 40; i++ {
+	for i := 0; i < sp; i++ {
 		c := line[i]
 		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
 			return "", 0, false
 		}
 	}
-	f := strings.Fields(line[41:])
+	f := strings.Fields(line[sp+1:])
 	if len(f) < 2 || len(f) > 3 {
+		return "", 0, false
+	}
+	if _, err := strconv.Atoi(f[0]); err != nil {
 		return "", 0, false
 	}
 	n, err := strconv.Atoi(f[1])
 	if err != nil {
 		return "", 0, false
 	}
-	return line[:40], n, true
+	return line[:sp], n, true
 }
 
 // IgnoreRevsFile returns the path of .git-blame-ignore-revs at the top level

@@ -50,6 +50,35 @@ func (p palette) wrap(code, s string) string {
 	return code + s + p.reset
 }
 
+// Sanitize neutralises terminal control characters in untrusted text (commit
+// subjects, author names, file paths, blamed source lines) before it is
+// printed to a terminal. Tabs are kept; every other C0/C1 control character
+// and DEL becomes '?'. JSON output does not need this.
+func Sanitize(s string) string {
+	clean := true
+	for _, r := range s {
+		if r < 0x20 && r != '\t' || r == 0x7f || r >= 0x80 && r <= 0x9f {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return s
+	}
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r == '\t':
+			b.WriteRune(r)
+		case r < 0x20, r == 0x7f, r >= 0x80 && r <= 0x9f:
+			b.WriteByte('?')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 // JSON writes the report as indented JSON.
 func JSON(w io.Writer, rep *stats.Report) error {
 	enc := json.NewEncoder(w)
@@ -123,11 +152,11 @@ func Table(w io.Writer, rep *stats.Report, o Options) {
 			if rep.Metric == "churn" {
 				n = a.Churn
 			}
-			models := strings.Join(a.Models, ", ")
-			if len(models) > 40 {
-				models = models[:37] + "…"
+			models := Sanitize(strings.Join(a.Models, ", "))
+			if utf8.RuneCountInString(models) > 40 {
+				models = string([]rune(models)[:37]) + "…"
 			}
-			rows = append(rows, []string{"  " + a.Name, commas(n), Pct(pct(n, tot.AI+tot.Human)), commas(a.Commits), models})
+			rows = append(rows, []string{"  " + Sanitize(a.Name), commas(n), Pct(pct(n, tot.AI+tot.Human)), commas(a.Commits), models})
 		}
 		writeAligned(w, rows, "", p, []int{0, 4})
 		fmt.Fprintln(w)
@@ -145,7 +174,7 @@ func Table(w io.Writer, rep *stats.Report, o Options) {
 				n, ai = a.Churn, a.AIChurn
 			}
 			_ = ai
-			rows = append(rows, []string{"  " + a.Name, commas(a.Commits), fmt.Sprintf("%s (%s)", commas(a.AICommits), Pct(pct(a.AICommits, a.Commits))), commas(n), Pct(a.AIShare)})
+			rows = append(rows, []string{"  " + Sanitize(a.Name), commas(a.Commits), fmt.Sprintf("%s (%s)", commas(a.AICommits), Pct(pct(a.AICommits, a.Commits))), commas(n), Pct(a.AIShare)})
 		}
 		writeAligned(w, rows, "", p, []int{0})
 		fmt.Fprintln(w)
@@ -169,7 +198,7 @@ func Table(w io.Writer, rep *stats.Report, o Options) {
 				if i >= top {
 					break
 				}
-				rows = append(rows, []string{"  " + d.Path, commas(d.Lines), commas(d.AILines), Pct(d.AIShare)})
+				rows = append(rows, []string{"  " + Sanitize(d.Path), commas(d.Lines), commas(d.AILines), Pct(d.AIShare)})
 			}
 			writeAligned(w, rows, "", p, []int{0})
 			fmt.Fprintln(w)
@@ -181,7 +210,7 @@ func Table(w io.Writer, rep *stats.Report, o Options) {
 				if i >= top {
 					break
 				}
-				rows = append(rows, []string{"  " + f.Path, commas(f.Lines), commas(f.AILines), Pct(f.AIShare)})
+				rows = append(rows, []string{"  " + Sanitize(f.Path), commas(f.Lines), commas(f.AILines), Pct(f.AIShare)})
 			}
 			writeAligned(w, rows, "", p, []int{0})
 			fmt.Fprintln(w)
@@ -213,7 +242,7 @@ func Table(w io.Writer, rep *stats.Report, o Options) {
 	foot = append(foot, fmt.Sprintf("%.1fs", float64(rep.DurationMS)/1000))
 	fmt.Fprintln(w, p.wrap(p.dim, strings.Join(foot, " · ")))
 	for _, warn := range rep.Warnings {
-		fmt.Fprintln(w, p.wrap(p.warn, "warning: "+warn))
+		fmt.Fprintln(w, p.wrap(p.warn, "warning: "+Sanitize(warn)))
 	}
 	if rep.Commits.AI == 0 {
 		fmt.Fprintln(w, p.wrap(p.dim, "\nNo AI disclosure found. aiblame only counts commits that disclose AI involvement\n(Co-authored-by / Assisted-by trailers, agent author identities, \"Generated with …\" markers).\nRun `aiblame hook install` to add trailers automatically from agent sessions."))
@@ -309,7 +338,7 @@ func mdTotals(w io.Writer, label string, t stats.Totals) {
 }
 
 func esc(s string) string {
-	return strings.NewReplacer("|", "\\|", "<", "&lt;", ">", "&gt;").Replace(s)
+	return strings.NewReplacer("|", "\\|", "<", "&lt;", ">", "&gt;").Replace(Sanitize(s))
 }
 
 func metricHeader(rep *stats.Report) string {

@@ -54,8 +54,14 @@ if command -v sha256sum >/dev/null 2>&1; then
   grep " $asset\$" SHA256SUMS | sha256sum -c - >/dev/null
 elif command -v shasum >/dev/null 2>&1; then
   grep " $asset\$" SHA256SUMS | shasum -a 256 -c - >/dev/null
+elif command -v openssl >/dev/null 2>&1; then
+  want=$(grep " $asset\$" SHA256SUMS | cut -d' ' -f1)
+  got=$(openssl dgst -sha256 "$asset" | sed 's/.*= //')
+  [ "$want" = "$got" ] || { echo "aiblame: checksum mismatch for $asset" >&2; exit 1; }
 else
-  echo "aiblame: warning: no sha256 tool found, skipping checksum verification" >&2
+  echo "aiblame: no sha256sum, shasum or openssl found; refusing to install an unverified binary" >&2
+  echo "        set AIBLAME_SKIP_VERIFY=1 to override" >&2
+  [ -n "${AIBLAME_SKIP_VERIFY:-}" ] || exit 1
 fi
 
 if [ "$os" = windows ]; then

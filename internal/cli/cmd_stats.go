@@ -41,7 +41,7 @@ func cmdStats(ctx context.Context, args []string, env Env) int {
 	if len(pos) == 1 {
 		target = pos[0]
 	}
-	r, err := openTarget(ctx, target, env, c.quiet)
+	r, warns, err := openTarget(ctx, target, env, c.quiet)
 	if err != nil {
 		return fail(env, err)
 	}
@@ -53,22 +53,27 @@ func cmdStats(ctx context.Context, args []string, env Env) int {
 	if err != nil {
 		return fail(env, err)
 	}
+	rep.Warnings = append(warns, rep.Warnings...)
 	w, closeFn, err := openOutput(c.output, env)
 	if err != nil {
 		return fail(env, err)
 	}
-	defer closeFn()
 	toStdout := c.output == "" || c.output == "-"
 	ropts := render.Options{Color: toStdout && useColor(env.Stdout, c.noColor, env.Getenv), Top: c.top, Compact: *compact}
 	switch format {
 	case "json":
 		if err := render.JSON(w, rep); err != nil {
+			_ = closeFn()
 			return fail(env, err)
 		}
 	case "md":
 		render.Markdown(w, rep, ropts)
 	default:
 		render.Table(w, rep, ropts)
+	}
+	// Close errors matter for -o: a full disk surfaces here, not on Write.
+	if err := closeFn(); err != nil {
+		return fail(env, fmt.Errorf("writing %s: %w", c.output, err))
 	}
 	if !toStdout && !c.quiet {
 		fmt.Fprintf(env.Stderr, "wrote %s\n", c.output)

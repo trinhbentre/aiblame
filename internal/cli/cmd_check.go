@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/trinhbentre/aiblame/internal/attrib"
 	"github.com/trinhbentre/aiblame/internal/render"
@@ -75,7 +76,7 @@ func cmdCheck(ctx context.Context, args []string, env Env) int {
 	if len(pos) == 1 {
 		target = pos[0]
 	}
-	r, err := openTarget(ctx, target, env, c.quiet)
+	r, warns, err := openTarget(ctx, target, env, c.quiet)
 	if err != nil {
 		return fail(env, err)
 	}
@@ -125,6 +126,7 @@ func cmdCheck(ctx context.Context, args []string, env Env) int {
 	if err != nil {
 		return fail(env, err)
 	}
+	rep.Warnings = append(warns, rep.Warnings...)
 	var share float64
 	switch *metric {
 	case "commits":
@@ -163,7 +165,7 @@ func cmdCheck(ctx context.Context, args []string, env Env) int {
 			if in, _ := an.InWindow(ctx, cc.Commit); !in {
 				continue
 			}
-			short := cc.Hash[:7] + " " + truncate(cc.Subject(), 60)
+			short := cc.Hash[:7] + " " + truncate(render.Sanitize(cc.Subject()), 60)
 			if *forbidAgent && cc.Attr.Kind == attrib.Agent {
 				agentAuthored = append(agentAuthored, short+" ("+cc.Attr.PrimaryAgent()+")")
 			}
@@ -188,7 +190,9 @@ func cmdCheck(ctx context.Context, args []string, env Env) int {
 	if format == "json" {
 		enc := json.NewEncoder(env.Stdout)
 		enc.SetIndent("", "  ")
-		_ = enc.Encode(out)
+		if err := enc.Encode(out); err != nil {
+			return fail(env, err)
+		}
 	} else {
 		color := useColor(env.Stdout, c.noColor, env.Getenv)
 		ok, bad := "PASS", "FAIL"
@@ -239,9 +243,12 @@ func capList(s []string, n int) []string {
 	return append(out, fmt.Sprintf("… and %d more", len(s)-n))
 }
 
+// truncate shortens s to at most n runes (not bytes) so multi-byte subjects
+// stay valid UTF-8.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	if n <= 1 || utf8.RuneCountInString(s) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	r := []rune(s)
+	return string(r[:n-1]) + "…"
 }

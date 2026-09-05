@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	"github.com/trinhbentre/aiblame/internal/testrepo"
 )
@@ -320,6 +322,45 @@ func TestConfigExcludeApplied(t *testing.T) {
 	repo.Write(".aiblame.toml", "[paths]\nexclude = 5\n")
 	if code, _, errs := run(t, repo.Dir, nil, "stats", "-q"); code != ExitError || !strings.Contains(errs, ".aiblame.toml") {
 		t.Fatalf("bad config: exit %d %q", code, errs)
+	}
+}
+
+func TestTruncateIsRuneSafe(t *testing.T) {
+	s := "fix: sửa lỗi hiển thị tiếng Việt và emoji 🤖🤖🤖"
+	got := truncate(s, 12)
+	if !utf8.ValidString(got) || utf8.RuneCountInString(got) != 12 || !strings.HasSuffix(got, "…") {
+		t.Fatalf("truncate = %q", got)
+	}
+	if truncate("short", 10) != "short" || truncate("ab", 1) != "ab" {
+		t.Fatal("truncate changed short strings")
+	}
+}
+
+func TestLockPath(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "x.lock")
+	unlock, err := lockPath(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p); err != nil {
+		t.Fatal("lock file missing")
+	}
+	// a stale lock (old mtime) is reclaimed
+	unlock()
+	os.WriteFile(p, []byte("stale"), 0o644)
+	old := time.Now().Add(-time.Hour)
+	os.Chtimes(p, old, old)
+	unlock2, err := lockPath(context.Background(), p)
+	if err != nil {
+		t.Fatalf("stale lock not reclaimed: %v", err)
+	}
+	unlock2()
+	// a fresh lock held by someone else makes us wait until ctx is cancelled
+	os.WriteFile(p, []byte("held"), 0o644)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if _, err := lockPath(ctx, p); err == nil {
+		t.Fatal("expected to give up on held lock")
 	}
 }
 

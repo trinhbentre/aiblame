@@ -109,6 +109,17 @@ func TestBadge(t *testing.T) {
 	}
 }
 
+func TestSanitize(t *testing.T) {
+	in := "title\x1b]0;pwned\x07 \x1b[31mred\x1b[0m\ttab\r\nnl nel ok"
+	got := Sanitize(in)
+	if strings.ContainsAny(got, "\x1b\x07\r\n") || !strings.Contains(got, "\ttab") || !strings.Contains(got, "ok") {
+		t.Fatalf("Sanitize = %q", got)
+	}
+	if Sanitize("plain ünïcödé 🤖") != "plain ünïcödé 🤖" {
+		t.Fatal("clean text changed")
+	}
+}
+
 func TestHelpers(t *testing.T) {
 	if commas(1234567) != "1,234,567" || commas(999) != "999" || commas(-1000) != "-1,000" || commas(0) != "0" {
 		t.Error("commas wrong")

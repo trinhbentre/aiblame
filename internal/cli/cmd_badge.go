@@ -56,7 +56,7 @@ func cmdBadge(ctx context.Context, args []string, env Env) int {
 	default:
 		return usageErr(env, fs, fmt.Errorf("--metric must be lines, churn or commits"))
 	}
-	r, err := openTarget(ctx, target, env, c.quiet)
+	r, _, err := openTarget(ctx, target, env, c.quiet)
 	if err != nil {
 		return fail(env, err)
 	}

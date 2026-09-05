@@ -189,6 +189,9 @@ func (a *Analyzer) Run(ctx context.Context) (*Report, error) {
 		Until:       opts.Until,
 		Includes:    opts.Include,
 	}
+	if a.Runner.IsShallow(ctx) {
+		rep.Warnings = append(rep.Warnings, "shallow clone: history is incomplete, so commit and line counts are understated (run `git fetch --unshallow`, or use fetch-depth: 0 in CI)")
+	}
 
 	// ---- file filter ------------------------------------------------------
 	var excl []string
@@ -347,6 +350,7 @@ func (a *Analyzer) Run(ctx context.Context) (*Report, error) {
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, opts.Jobs)
 		done := 0
+		blameFailed := 0
 		var firstErr error
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -372,8 +376,10 @@ func (a *Analyzer) Run(ctx context.Context) (*Report, error) {
 					if ctx.Err() != nil {
 						return
 					}
-					// Skip unreadable files (e.g. submodule gitlinks) but keep going.
+					// Skip unreadable files (e.g. submodule gitlinks) but keep going;
+					// the total is reported below and Run fails if nothing worked.
 					rep.SkippedFiles++
+					blameFailed++
 					if len(rep.Warnings) < 20 {
 						rep.Warnings = append(rep.Warnings, fmt.Sprintf("blame %s: %v", p, shortErr(err)))
 					}
@@ -413,7 +419,15 @@ func (a *Analyzer) Run(ctx context.Context) (*Report, error) {
 			}()
 		}
 		wg.Wait()
-		_ = firstErr
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if blameFailed > 0 {
+			if blameFailed == len(files) {
+				return nil, fmt.Errorf("git blame failed for all %d files (first error: %w)", len(files), firstErr)
+			}
+			rep.Warnings = append(rep.Warnings, fmt.Sprintf("%d of %d files could not be blamed and were skipped", blameFailed, len(files)))
+		}
 		lines.Finalize()
 		rep.Lines = lines
 		for name, n := range agentLines {

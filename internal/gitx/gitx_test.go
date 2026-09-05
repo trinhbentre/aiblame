@@ -2,6 +2,8 @@ package gitx
 
 import (
 	"context"
+	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/trinhbentre/aiblame/internal/testrepo"
@@ -36,7 +38,10 @@ func TestParseBlamePorcelain(t *testing.T) {
 	out := sha1 + " 1 1 2\nauthor A\nauthor-mail <a@a>\nsummary s\nfilename f\n\tline one\n" +
 		sha1 + " 2 2\n\tline two\n" +
 		sha2 + " 1 3 1\nauthor B\nboundary\nfilename f\n\tline three\n"
-	res := ParseBlamePorcelain([]byte(out), true)
+	res, err := ParseBlamePorcelain([]byte(out), true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(res.Lines) != 3 {
 		t.Fatalf("lines = %d", len(res.Lines))
 	}
@@ -45,6 +50,57 @@ func TestParseBlamePorcelain(t *testing.T) {
 	}
 	if res.Lines[2].Content != "line three" || res.Lines[2].LineNo != 3 {
 		t.Fatalf("line3 = %+v", res.Lines[2])
+	}
+	// SHA-256 repositories emit 64-hex object names.
+	sha256 := strings.Repeat("c", 64)
+	res, err = ParseBlamePorcelain([]byte(sha256+" 1 1 1\nauthor C\n\tx\n"), false)
+	if err != nil || res.Counts[sha256] != 1 {
+		t.Fatalf("sha256 header not parsed: %v %v", err, res)
+	}
+	// A header without its content line means the output was cut short.
+	if _, err := ParseBlamePorcelain([]byte(sha1+" 1 1 1\nauthor A\n"), false); err == nil {
+		t.Fatal("expected truncation error")
+	}
+	if h, _, ok := parseBlameHeader("not a header line"); ok || h != "" {
+		t.Fatal("garbage accepted as header")
+	}
+}
+
+func TestIsShallow(t *testing.T) {
+	repo := testrepo.Standard(t)
+	ctx := context.Background()
+	r, err := Open(ctx, repo.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.IsShallow(ctx) {
+		t.Fatal("full repo reported as shallow")
+	}
+	dst := t.TempDir()
+	cmd := exec.Command("git", "clone", "--quiet", "--depth", "1", "file://"+repo.Dir, dst)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("shallow clone not supported here: %v %s", err, out)
+	}
+	sr, err := Open(ctx, dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sr.IsShallow(ctx) {
+		t.Fatal("depth-1 clone not reported as shallow")
+	}
+}
+
+func TestLogRejectsOptionLikeRev(t *testing.T) {
+	repo := testrepo.Standard(t)
+	ctx := context.Background()
+	r, err := Open(ctx, repo.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// With the "--" separator git treats this as a (missing) revision, not as
+	// an option that would write a file.
+	if _, err := r.Log(ctx, LogOptions{Rev: "--output=" + t.TempDir() + "/pwned"}); err == nil {
+		t.Fatal("option-like rev must not be accepted")
 	}
 }
 

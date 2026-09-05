@@ -119,7 +119,10 @@ func (r *Runner) Version(ctx context.Context) (string, error) {
 
 // ResolveRev returns the full hash for a revision expression.
 func (r *Runner) ResolveRev(ctx context.Context, rev string) (string, error) {
-	out, err := r.Run(ctx, "rev-parse", "--verify", "--quiet", rev+"^{commit}")
+	if rev == "" || strings.HasPrefix(rev, "-") {
+		return "", fmt.Errorf("invalid revision %q", rev)
+	}
+	out, err := r.Run(ctx, "rev-parse", "--verify", "--quiet", "--end-of-options", rev+"^{commit}")
 	if err != nil {
 		return "", fmt.Errorf("cannot resolve revision %q: %w", rev, err)
 	}
@@ -130,6 +133,23 @@ func (r *Runner) ResolveRev(ctx context.Context, rev string) (string, error) {
 func (r *Runner) HasCommits(ctx context.Context) bool {
 	_, err := r.Run(ctx, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
 	return err == nil
+}
+
+// IsShallow reports whether the repository is a shallow clone (e.g. CI
+// checkouts with fetch-depth 1), in which case history-based statistics are
+// incomplete.
+func (r *Runner) IsShallow(ctx context.Context) bool {
+	out, err := r.Run(ctx, "rev-parse", "--is-shallow-repository")
+	if err != nil {
+		// Older git: fall back to the presence of .git/shallow.
+		if p, perr := r.GitPath(ctx, "shallow"); perr == nil {
+			if _, serr := os.Stat(p); serr == nil {
+				return true
+			}
+		}
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "true"
 }
 
 // FileStat is one --numstat row.
@@ -216,11 +236,12 @@ func (r *Runner) Log(ctx context.Context, opts LogOptions) ([]Commit, error) {
 	if opts.MaxCount > 0 {
 		args = append(args, "-n", strconv.Itoa(opts.MaxCount))
 	}
-	args = append(args, rev)
-	if len(opts.Paths) > 0 {
-		args = append(args, "--")
-		args = append(args, opts.Paths...)
+	if strings.HasPrefix(rev, "-") {
+		// Never let a revision be parsed as a git option (e.g. --output=FILE).
+		return nil, fmt.Errorf("gitx: invalid revision %q", rev)
 	}
+	args = append(args, rev, "--")
+	args = append(args, opts.Paths...)
 	out, err := r.Run(ctx, args...)
 	if err != nil {
 		return nil, err
@@ -239,8 +260,14 @@ func ParseLog(out []byte) ([]Commit, error) {
 		if len(fields) < 9 {
 			return nil, fmt.Errorf("gitx: malformed log record (%d fields)", len(fields))
 		}
-		at, _ := strconv.ParseInt(fields[4], 10, 64)
-		ct, _ := strconv.ParseInt(fields[7], 10, 64)
+		at, err := strconv.ParseInt(fields[4], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("gitx: malformed author timestamp %q for commit %s", fields[4], fields[0])
+		}
+		ct, err := strconv.ParseInt(fields[7], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("gitx: malformed committer timestamp %q for commit %s", fields[7], fields[0])
+		}
 		c := Commit{
 			Hash:           fields[0],
 			Parents:        strings.Fields(fields[1]),
@@ -362,7 +389,9 @@ func (r *Runner) FileSizes(ctx context.Context, rev string) (map[string]int64, e
 		}
 		n, err := strconv.ParseInt(f[3], 10, 64)
 		if err != nil {
-			continue
+			// Keep the path so callers can account for it (size 0 is skipped
+			// and counted) instead of silently dropping the file.
+			n = 0
 		}
 		sizes[path] = n
 	}

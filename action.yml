@@ -87,38 +87,49 @@ runs:
           echo "::warning::Shallow clone detected; use actions/checkout with fetch-depth: 0 so aiblame can see the full history."
         fi
 
+    # Inputs are passed through `env:` and expanded by the shell, never
+    # interpolated into the script text, so they cannot inject commands.
     - name: Report
       id: report
       shell: bash
       working-directory: ${{ inputs.path }}
+      env:
+        AIBLAME_ARGS: ${{ inputs.args }}
+        AIBLAME_SUMMARY: ${{ inputs.summary }}
       run: |
         set -euo pipefail
         report="$RUNNER_TEMP/aiblame-report.json"
         # shellcheck disable=SC2086
-        aiblame stats . --json --quiet ${{ inputs.args }} > "$report"
+        aiblame stats . --json --quiet $AIBLAME_ARGS > "$report"
         share=$(jq -r '.headline_ai_share' "$report")
         printf 'ai-share=%.1f\n' "$share" >> "$GITHUB_OUTPUT"
         echo "report=$report" >> "$GITHUB_OUTPUT"
         echo "AI share: ${share}%"
-        if [ "${{ inputs.summary }}" = "true" ]; then
+        if [ "$AIBLAME_SUMMARY" = "true" ]; then
           # shellcheck disable=SC2086
-          aiblame stats . -f md --quiet ${{ inputs.args }} >> "$GITHUB_STEP_SUMMARY"
+          aiblame stats . -f md --quiet $AIBLAME_ARGS >> "$GITHUB_STEP_SUMMARY"
         fi
 
     - name: Badge
       if: inputs.badge-path != ''
       shell: bash
       working-directory: ${{ inputs.path }}
+      env:
+        AIBLAME_ARGS: ${{ inputs.args }}
+        AIBLAME_BADGE_PATH: ${{ inputs.badge-path }}
+        AIBLAME_BADGE_COLOR: ${{ inputs.badge-color }}
       run: |
         set -euo pipefail
         # shellcheck disable=SC2086
-        aiblame badge . --quiet --shields "${{ inputs.badge-path }}" --color "${{ inputs.badge-color }}" ${{ inputs.args }}
+        aiblame badge . --quiet --shields "$AIBLAME_BADGE_PATH" --color "$AIBLAME_BADGE_COLOR" $AIBLAME_ARGS
 
     - name: Policy check
       if: inputs.check-args != ''
       shell: bash
       working-directory: ${{ inputs.path }}
+      env:
+        AIBLAME_CHECK_ARGS: ${{ inputs.check-args }}
       run: |
         set -euo pipefail
         # shellcheck disable=SC2086
-        aiblame check . --no-color --quiet ${{ inputs.check-args }}
+        aiblame check . --no-color --quiet $AIBLAME_CHECK_ARGS
