@@ -1,0 +1,9 @@
+# aiblame dogfood config — https://github.com/trinhbentre/aiblame
+
+[check]
+# every AI-assisted commit in this repo must carry a Co-authored-by trailer
+require_trailer = "co-authored-by"
+
+[badge]
+label = "AI-written"
+color = "7c3aed"

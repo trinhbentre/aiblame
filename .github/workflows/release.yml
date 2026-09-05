@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: test
+        run: go test -count=1 ./...
+      - name: cross-compile
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: make dist VERSION="$VERSION" COMMIT="${GITHUB_SHA::7}"
+      - name: release notes
+        id: notes
+        run: |
+          {
+            echo "## aiblame ${GITHUB_REF_NAME}"
+            echo
+            awk -v tag="${GITHUB_REF_NAME#v}" '
+              /^## \[/ { if (found) exit; if (index($0, "[" tag "]")) { found=1; next } }
+              found { print }
+            ' CHANGELOG.md
+            echo
+            echo '### Install'
+            echo
+            echo '```sh'
+            echo 'curl -fsSL https://raw.githubusercontent.com/trinhbentre/aiblame/main/install.sh | sh'
+            echo '# or'
+            echo "go install github.com/trinhbentre/aiblame/cmd/aiblame@${GITHUB_REF_NAME}"
+            echo '```'
+            echo
+            echo 'Checksums are in `SHA256SUMS`.'
+          } > notes.md
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "aiblame $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --verify-tag

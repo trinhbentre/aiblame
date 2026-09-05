@@ -1,0 +1,124 @@
+name: aiblame
+description: >-
+  How much of this repository was written with AI? Reports AI authorship from
+  git trailers and agent identities, writes a job summary, an optional
+  shields.io badge file, and can fail the job on a disclosure policy.
+author: trinhbentre
+branding:
+  icon: git-commit
+  color: purple
+
+inputs:
+  version:
+    description: aiblame release tag to use (e.g. v1.0.0) or "latest".
+    default: latest
+  path:
+    description: Repository path to analyse.
+    default: "."
+  args:
+    description: Extra flags passed to `aiblame stats` (e.g. "--since 2026-01-01 --no-blame").
+    default: ""
+  summary:
+    description: Append a Markdown report to the job summary.
+    default: "true"
+  badge-path:
+    description: If set, write a shields.io endpoint JSON here (commit or publish it and use img.shields.io/endpoint).
+    default: ""
+  badge-color:
+    description: Badge colour (hex, shields name, or "auto").
+    default: "7c3aed"
+  check-args:
+    description: >-
+      If set, run `aiblame check` with these flags and fail the job when a rule
+      fails (e.g. "--max 60 --require-trailer assisted-by").
+    default: ""
+
+outputs:
+  ai-share:
+    description: Headline AI share in percent (surviving lines, or lines added with --no-blame).
+    value: ${{ steps.report.outputs.ai-share }}
+  report:
+    description: Path to the JSON report.
+    value: ${{ steps.report.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install aiblame
+      shell: bash
+      env:
+        AIBLAME_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS" in
+          Linux)   os=linux ;;
+          macOS)   os=darwin ;;
+          Windows) os=windows ;;
+          *) echo "unsupported OS $RUNNER_OS" >&2; exit 1 ;;
+        esac
+        case "$RUNNER_ARCH" in
+          X64)   arch=amd64 ;;
+          ARM64) arch=arm64 ;;
+          *) echo "unsupported arch $RUNNER_ARCH" >&2; exit 1 ;;
+        esac
+        dir="$RUNNER_TEMP/aiblame-bin"
+        mkdir -p "$dir"
+        if [ "$AIBLAME_VERSION" = "latest" ]; then
+          base="https://github.com/trinhbentre/aiblame/releases/latest/download"
+        else
+          base="https://github.com/trinhbentre/aiblame/releases/download/$AIBLAME_VERSION"
+        fi
+        if [ "$os" = windows ]; then
+          curl -fsSL "$base/aiblame_${os}_${arch}.zip" -o "$dir/aiblame.zip"
+          (cd "$dir" && unzip -oq aiblame.zip && mv "aiblame_${os}_${arch}.exe" aiblame.exe)
+        else
+          curl -fsSL "$base/aiblame_${os}_${arch}.tar.gz" | tar -xz -C "$dir"
+          mv "$dir/aiblame_${os}_${arch}" "$dir/aiblame"
+          chmod +x "$dir/aiblame"
+        fi
+        echo "$dir" >> "$GITHUB_PATH"
+        "$dir/aiblame" version
+
+    - name: Warn on shallow clone
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          echo "::warning::Shallow clone detected; use actions/checkout with fetch-depth: 0 so aiblame can see the full history."
+        fi
+
+    - name: Report
+      id: report
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        set -euo pipefail
+        report="$RUNNER_TEMP/aiblame-report.json"
+        # shellcheck disable=SC2086
+        aiblame stats . --json --quiet ${{ inputs.args }} > "$report"
+        share=$(jq -r '.headline_ai_share' "$report")
+        printf 'ai-share=%.1f\n' "$share" >> "$GITHUB_OUTPUT"
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+        echo "AI share: ${share}%"
+        if [ "${{ inputs.summary }}" = "true" ]; then
+          # shellcheck disable=SC2086
+          aiblame stats . -f md --quiet ${{ inputs.args }} >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Badge
+      if: inputs.badge-path != ''
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        set -euo pipefail
+        # shellcheck disable=SC2086
+        aiblame badge . --quiet --shields "${{ inputs.badge-path }}" --color "${{ inputs.badge-color }}" ${{ inputs.args }}
+
+    - name: Policy check
+      if: inputs.check-args != ''
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        set -euo pipefail
+        # shellcheck disable=SC2086
+        aiblame check . --no-color --quiet ${{ inputs.check-args }}

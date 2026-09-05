@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        if: runner.os == 'Linux'
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: go vet
+        run: go vet ./...
+      - name: go test (race)
+        if: runner.os != 'Windows'
+        run: go test -race -count=1 ./...
+      - name: go test
+        if: runner.os == 'Windows'
+        run: go test -count=1 ./...
+      - name: build
+        run: go build -trimpath -o aiblame${{ runner.os == 'Windows' && '.exe' || '' }} ./cmd/aiblame
+      - name: dogfood
+        if: runner.os == 'Linux'
+        run: |
+          ./aiblame stats . --no-color
+          echo '### aiblame on this repository' >> "$GITHUB_STEP_SUMMARY"
+          ./aiblame stats . -f md --compact >> "$GITHUB_STEP_SUMMARY"
+          ./aiblame check . --require-trailer co-authored-by --no-color || true
