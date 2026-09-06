@@ -325,6 +325,157 @@ func TestConfigExcludeApplied(t *testing.T) {
 	}
 }
 
+func TestCheckPoliciesAndNewRules(t *testing.T) {
+	repo := testrepo.Standard(t)
+	// Mesa policy: the Claude/Codex Co-authored-by commits violate the
+	// forbid-trailer rule and the require-trailer rule; devin is agent-authored.
+	code, out, _ := run(t, repo.Dir, nil, "check", repo.Dir, "--policy", "mesa", "--no-blame", "--no-color", "-q")
+	if code != ExitFailed {
+		t.Fatalf("mesa policy should fail (exit %d):\n%s", code, out)
+	}
+	for _, want := range []string{"policy mesa", "FAIL  forbid-trailer", "FAIL  require-trailer", "FAIL  forbid-agent-authored", "PASS  forbid-agent-signoff", "co-authored-by"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+	// Kubernetes policy in JSON: every trailer is forbidden.
+	code, out, _ = run(t, repo.Dir, nil, "check", repo.Dir, "--policy", "kubernetes", "--no-blame", "--json", "-q")
+	if code != ExitFailed {
+		t.Fatalf("kubernetes policy exit %d", code)
+	}
+	var res map[string]any
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("bad json: %v\n%s", err, out)
+	}
+	if res["policy"] != "kubernetes" || res["pass"] != false {
+		t.Fatalf("json = %v", res)
+	}
+	// An explicit forbid-trailer for a convention nobody used passes.
+	code, out, _ = run(t, repo.Dir, nil, "check", repo.Dir, "--forbid-trailer", "generated-by", "--forbid-agent-signoff", "--no-blame", "--no-color", "-q")
+	if code != ExitOK || !strings.Contains(out, "PASS  forbid-trailer") {
+		t.Fatalf("forbid unused convention: exit %d\n%s", code, out)
+	}
+	// require-trailer accepts alternatives.
+	code, out, _ = run(t, repo.Dir, nil, "check", repo.Dir, "--require-trailer", "assisted-by,co-authored-by", "--no-blame", "--no-color", "-q")
+	if code != ExitOK || !strings.Contains(out, "assisted-by or co-authored-by") {
+		t.Fatalf("require alternatives: exit %d\n%s", code, out)
+	}
+	// Unknown convention and unknown policy are usage errors.
+	if code, _, errs := run(t, repo.Dir, nil, "check", repo.Dir, "--require-trailer", "signed-by-robots"); code != ExitUsage || !strings.Contains(errs, "not a known convention") {
+		t.Fatalf("unknown convention: exit %d %q", code, errs)
+	}
+	if code, _, errs := run(t, repo.Dir, nil, "check", repo.Dir, "--policy", "nope"); code != ExitUsage || !strings.Contains(errs, "unknown policy") {
+		t.Fatalf("unknown policy: exit %d %q", code, errs)
+	}
+	// --list-policies needs no repository.
+	code, out, _ = run(t, t.TempDir(), nil, "check", "--list-policies")
+	if code != ExitOK || !strings.Contains(out, "kernel") || !strings.Contains(out, "kubernetes") || !strings.Contains(out, "source:") {
+		t.Fatalf("list policies: exit %d\n%s", code, out)
+	}
+	// An AI Signed-off-by is caught.
+	repo.Write("src/dco.go", "x\n")
+	repo.Commit(testrepo.CommitOpts{Message: "fix: dco\n\nSigned-off-by: Claude <noreply@anthropic.com>"})
+	code, out, _ = run(t, repo.Dir, nil, "check", repo.Dir, "--forbid-agent-signoff", "--no-blame", "--no-color", "-q")
+	if code != ExitFailed || !strings.Contains(out, "FAIL  forbid-agent-signoff") {
+		t.Fatalf("agent signoff: exit %d\n%s", code, out)
+	}
+	// Config-driven policy.
+	if err := os.WriteFile(filepath.Join(repo.Dir, ".aiblame.toml"), []byte("[check]\npolicy = \"asf\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out, _ = run(t, repo.Dir, nil, "check", repo.Dir, "--no-blame", "--no-color", "-q")
+	if code != ExitFailed || !strings.Contains(out, "policy asf") || !strings.Contains(out, "without a generated-by trailer") {
+		t.Fatalf("config policy: exit %d\n%s", code, out)
+	}
+}
+
+func TestRangeAndPrivacyFlags(t *testing.T) {
+	repo := testrepo.Standard(t)
+	code, out, errs := run(t, repo.Dir, nil, "stats", repo.Dir, "--rev", "HEAD~3..HEAD", "--json", "-q")
+	if code != ExitOK {
+		t.Fatalf("range stats exit %d: %s", code, errs)
+	}
+	var rep map[string]any
+	if err := json.Unmarshal([]byte(out), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep["base_rev"] != "HEAD~3" || rep["rev"] != "HEAD~3..HEAD" || rep["headline_ai_share"].(float64) != 100 {
+		t.Fatalf("range json = %v", rep)
+	}
+	code, out, _ = run(t, repo.Dir, nil, "stats", repo.Dir, "--rev", "HEAD~3..HEAD", "--no-color", "-q")
+	if code != ExitOK || !strings.Contains(out, "range HEAD~3..HEAD") {
+		t.Fatalf("range table:\n%s", out)
+	}
+	code, out, _ = run(t, repo.Dir, nil, "check", repo.Dir, "--rev", "HEAD~3..HEAD", "--forbid-agent-authored", "--no-blame", "--no-color", "-q")
+	if code != ExitFailed || !strings.Contains(out, "@ HEAD~3..HEAD") {
+		t.Fatalf("range check: exit %d\n%s", code, out)
+	}
+	code, out, _ = run(t, repo.Dir, nil, "log", repo.Dir, "--rev", "HEAD~3..HEAD", "--json")
+	if code != ExitOK || strings.Count(out, `"hash"`) != 3 {
+		t.Fatalf("range log: exit %d\n%s", code, out)
+	}
+	code, out, _ = run(t, repo.Dir, nil, "stats", repo.Dir, "--no-authors", "--no-color", "-q")
+	if code != ExitOK || strings.Contains(out, "Contributors") {
+		t.Fatalf("--no-authors still printed contributors:\n%s", out)
+	}
+	code, out, _ = run(t, repo.Dir, nil, "stats", repo.Dir, "--no-color", "-q")
+	if code != ExitOK || !strings.Contains(out, "Still in the tree") {
+		t.Fatalf("survival line missing:\n%s", out)
+	}
+}
+
+func TestProvenanceThroughCLI(t *testing.T) {
+	repo := testrepo.Standard(t)
+	hashes := strings.Fields(repo.Git("rev-list", "HEAD"))
+	initial := hashes[len(hashes)-1]
+	note := "src/human.go\n  s_1::t_1 1-5\n---\n" +
+		`{"schema_version":"authorship/3.0.0","base_commit_sha":"","prompts":{},"sessions":{"s_1":{"agent_id":{"tool":"cursor","id":"x","model":"claude-sonnet-4-5"},"human_author":"human@example.com"}}}`
+	repo.Git("notes", "--ref=ai", "add", "-m", note, initial)
+
+	code, out, _ := run(t, repo.Dir, nil, "stats", repo.Dir, "--no-color", "-q")
+	if code != ExitOK || !strings.Contains(out, "Cursor") || !strings.Contains(out, "sidecar data: git-ai-notes 1") || !strings.Contains(out, "1 commits attributed line by line") {
+		t.Fatalf("stats with notes:\n%s", out)
+	}
+	code, out, _ = run(t, repo.Dir, nil, "stats", repo.Dir, "--no-provenance", "--no-color", "-q")
+	if code != ExitOK || strings.Contains(out, "Cursor") {
+		t.Fatalf("--no-provenance still read notes:\n%s", out)
+	}
+	// blame shows the five Cursor lines and 15 human lines.
+	code, out, _ = run(t, repo.Dir, nil, "blame", filepath.Join(repo.Dir, "src", "human.go"), "--no-color")
+	if code != ExitOK || strings.Count(out, "ASSIST Cursor") != 5 || !strings.Contains(out, "25.0% AI-written (5 assisted") {
+		t.Fatalf("blame with notes:\n%s", out)
+	}
+	// log --evidence explains what was not counted.
+	repo.Write("docs/x.md", "x\n")
+	repo.Commit(testrepo.CommitOpts{Message: "docs\n\nGenerated-By: StageFreight\nAssisted-by: Viktor Szakats"})
+	code, out, _ = run(t, repo.Dir, nil, "log", repo.Dir, "--evidence", "-n", "1", "--no-color")
+	if code != ExitOK || !strings.Contains(out, "HUMAN") || !strings.Contains(out, "not counted trailer:Generated-By: StageFreight") || !strings.Contains(out, "names a person") {
+		t.Fatalf("log evidence:\n%s", out)
+	}
+	code, out, _ = run(t, repo.Dir, nil, "stats", repo.Dir, "--no-blame", "--no-color", "-q")
+	if code != ExitOK || !strings.Contains(out, "StageFreight (1)") {
+		t.Fatalf("unrecognised hint missing:\n%s", out)
+	}
+}
+
+func TestRemoteURLHosts(t *testing.T) {
+	cases := map[string]string{
+		"codeberg.org/forgejo/forgejo": "https://codeberg.org/forgejo/forgejo.git",
+		"gitlab.com/gitlab-org/cli":    "https://gitlab.com/gitlab-org/cli.git",
+		"owner/repo":                   "https://github.com/owner/repo.git",
+	}
+	for in, want := range cases {
+		if got, ok := remoteURL(in); !ok || got != want {
+			t.Errorf("remoteURL(%q) = %q,%v want %q", in, got, ok, want)
+		}
+	}
+	for _, bad := range []string{"-x/owner/repo", "codeberg.org/-owner/repo", "a/b/c", "./x/y", ".hidden/x/y"} {
+		if _, ok := remoteURL(bad); ok {
+			t.Errorf("remoteURL(%q) should be rejected", bad)
+		}
+	}
+}
+
 func TestTruncateIsRuneSafe(t *testing.T) {
 	s := "fix: sửa lỗi hiển thị tiếng Việt và emoji 🤖🤖🤖"
 	got := truncate(s, 12)

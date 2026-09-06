@@ -25,7 +25,11 @@ environment variables agents set in their subprocesses:
 Overrides: AIBLAME_AGENT, AIBLAME_MODEL, AIBLAME_EMAIL. Disable: AIBLAME_DISABLE=1.
 
 Flags:
-  --style S    assisted-by (default) | co-authored-by | generated-by
+  --style S    assisted-by (default)  Assisted-by: Claude Code (model)
+               kernel                 Assisted-by: LLM            (Linux 7.3+)
+               agent-model            Assisted-by: Claude Code:model (Zephyr, kernel 7.0)
+               co-authored-by         Co-authored-by: Claude <noreply@anthropic.com>
+               generated-by           Generated-by: Claude Code (model: …)  (ASF, Mesa)
   --force      Replace a prepare-commit-msg hook that aiblame did not write
   -C DIR       Repository directory (default: current)
 

@@ -139,11 +139,19 @@ func Table(w io.Writer, rep *stats.Report, o Options) {
 		rows = append(rows, []string{"Surviving lines", commas(rep.Lines.Total), fmt.Sprintf("%s (%s)", commas(rep.Lines.AI), Pct(rep.Lines.AIShare)), commas(rep.Lines.Assisted), commas(rep.Lines.Agent), commas(rep.Lines.Human), commas(rep.Lines.Bot)})
 	}
 	writeAligned(w, rows, "  ", p, []int{0})
+	if line := survivalLine(rep); line != "" {
+		fmt.Fprintf(w, "  %s\n", p.wrap(p.dim, line))
+	}
 	fmt.Fprintln(w)
 
 	if len(rep.Agents) > 0 {
 		fmt.Fprintln(w, p.wrap(p.bold, "Agents"))
-		rows = [][]string{{"", metricHeader(rep), "share", "commits", "models"}}
+		header := []string{"", metricHeader(rep), "share", "commits"}
+		if rep.Survival != nil {
+			header = append(header, "survival")
+		}
+		header = append(header, "models")
+		rows = [][]string{header}
 		for i, a := range rep.Agents {
 			if i >= top {
 				break
@@ -156,9 +164,13 @@ func Table(w io.Writer, rep *stats.Report, o Options) {
 			if utf8.RuneCountInString(models) > 40 {
 				models = string([]rune(models)[:37]) + "…"
 			}
-			rows = append(rows, []string{"  " + Sanitize(a.Name), commas(n), Pct(pct(n, tot.AI+tot.Human)), commas(a.Commits), models})
+			row := []string{"  " + Sanitize(a.Name), commas(n), Pct(pct(n, tot.AI+tot.Human)), commas(a.Commits)}
+			if rep.Survival != nil {
+				row = append(row, survivalCell(a.Survival))
+			}
+			rows = append(rows, append(row, models))
 		}
-		writeAligned(w, rows, "", p, []int{0, 4})
+		writeAligned(w, rows, "", p, []int{0, len(header) - 1})
 		fmt.Fprintln(w)
 	}
 
@@ -225,6 +237,9 @@ func Table(w io.Writer, rep *stats.Report, o Options) {
 	}
 
 	var foot []string
+	if rep.BaseRev != "" {
+		foot = append(foot, fmt.Sprintf("range %s: only what the range introduced", rep.RevName))
+	}
 	if rep.Lines != nil {
 		foot = append(foot, fmt.Sprintf("%d files blamed", rep.FileCount))
 		if rep.SkippedFiles > 0 {
@@ -239,10 +254,27 @@ func Table(w io.Writer, rep *stats.Report, o Options) {
 	if len(rep.Excludes) > 0 {
 		foot = append(foot, fmt.Sprintf("%d exclude patterns", len(rep.Excludes)))
 	}
+	if len(rep.Provenance) > 0 {
+		var parts []string
+		for _, s := range rep.Provenance {
+			parts = append(parts, fmt.Sprintf("%s %s", s.Name, commas(s.Commits)))
+		}
+		foot = append(foot, "sidecar data: "+strings.Join(parts, ", "))
+	}
+	if rep.LineLevelCommits > 0 {
+		foot = append(foot, fmt.Sprintf("%d commits attributed line by line", rep.LineLevelCommits))
+	}
 	foot = append(foot, fmt.Sprintf("%.1fs", float64(rep.DurationMS)/1000))
 	fmt.Fprintln(w, p.wrap(p.dim, strings.Join(foot, " · ")))
 	for _, warn := range rep.Warnings {
 		fmt.Fprintln(w, p.wrap(p.warn, "warning: "+Sanitize(warn)))
+	}
+	if len(rep.Unrecognised) > 0 {
+		var parts []string
+		for _, u := range rep.Unrecognised {
+			parts = append(parts, fmt.Sprintf("%s (%s)", Sanitize(u.Name), commas(u.Commits)))
+		}
+		fmt.Fprintln(w, p.wrap(p.dim, "Not counted: Generated-by/Made-with trailers naming tools aiblame does not know as AI agents: "+strings.Join(parts, ", ")+".\nIf they are agents, add them under [[detect.agents]] in .aiblame.toml."))
 	}
 	if rep.Commits.AI == 0 {
 		fmt.Fprintln(w, p.wrap(p.dim, "\nNo AI disclosure found. aiblame only counts commits that disclose AI involvement\n(Co-authored-by / Assisted-by trailers, agent author identities, \"Generated with …\" markers).\nRun `aiblame hook install` to add trailers automatically from agent sessions."))
@@ -266,8 +298,15 @@ func Markdown(w io.Writer, rep *stats.Report, o Options) {
 		short = short[:7]
 	}
 	fmt.Fprintf(w, "## AI authorship · %s\n\n", Pct(rep.Headline))
-	fmt.Fprintf(w, "**%s** of %s %s were written with AI (%s assisted, %s agent-authored, %s human, %s bot). Revision `%s`.\n\n",
-		Pct(rep.Headline), commas(tot.AI+tot.Human), unit, commas(tot.Assisted), commas(tot.Agent), commas(tot.Human), commas(tot.Bot), short)
+	scope := "Revision `" + short + "`"
+	if rep.BaseRev != "" {
+		scope = "Range `" + rep.RevName + "` (only what the range introduced)"
+	}
+	fmt.Fprintf(w, "**%s** of %s %s were written with AI (%s assisted, %s agent-authored, %s human, %s bot). %s.\n\n",
+		Pct(rep.Headline), commas(tot.AI+tot.Human), unit, commas(tot.Assisted), commas(tot.Agent), commas(tot.Human), commas(tot.Bot), scope)
+	if line := survivalLine(rep); line != "" {
+		fmt.Fprintf(w, "%s.\n\n", line)
+	}
 
 	fmt.Fprintln(w, "| | Total | AI | Assisted | Agent | Human | Bot |")
 	fmt.Fprintln(w, "|---|---:|---:|---:|---:|---:|---:|")
@@ -279,7 +318,11 @@ func Markdown(w io.Writer, rep *stats.Report, o Options) {
 	fmt.Fprintln(w)
 
 	if len(rep.Agents) > 0 {
-		fmt.Fprintf(w, "### Agents\n\n| Agent | %s | Share | Commits | Models |\n|---|---:|---:|---:|---|\n", metricHeader(rep))
+		if rep.Survival != nil {
+			fmt.Fprintf(w, "### Agents\n\n| Agent | %s | Share | Commits | Survival | Models |\n|---|---:|---:|---:|---:|---|\n", metricHeader(rep))
+		} else {
+			fmt.Fprintf(w, "### Agents\n\n| Agent | %s | Share | Commits | Models |\n|---|---:|---:|---:|---|\n", metricHeader(rep))
+		}
 		for i, a := range rep.Agents {
 			if i >= top {
 				break
@@ -288,7 +331,11 @@ func Markdown(w io.Writer, rep *stats.Report, o Options) {
 			if rep.Metric == "churn" {
 				n = a.Churn
 			}
-			fmt.Fprintf(w, "| %s | %s | %s | %s | %s |\n", esc(a.Name), commas(n), Pct(pct(n, tot.AI+tot.Human)), commas(a.Commits), esc(strings.Join(a.Models, ", ")))
+			if rep.Survival != nil {
+				fmt.Fprintf(w, "| %s | %s | %s | %s | %s | %s |\n", esc(a.Name), commas(n), Pct(pct(n, tot.AI+tot.Human)), commas(a.Commits), survivalCell(a.Survival), esc(strings.Join(a.Models, ", ")))
+			} else {
+				fmt.Fprintf(w, "| %s | %s | %s | %s | %s |\n", esc(a.Name), commas(n), Pct(pct(n, tot.AI+tot.Human)), commas(a.Commits), esc(strings.Join(a.Models, ", ")))
+			}
 		}
 		fmt.Fprintln(w)
 	}
@@ -309,7 +356,7 @@ func Markdown(w io.Writer, rep *stats.Report, o Options) {
 	if len(rep.Conventions) > 0 {
 		fmt.Fprintln(w, "### Disclosure conventions\n\n| Convention | Commits |\n|---|---:|")
 		for _, c := range rep.Conventions {
-			fmt.Fprintf(w, "| `%s` | %s |\n", c.Name, commas(c.Commits))
+			fmt.Fprintf(w, "| %s | %s |\n", mdCode(c.Name), commas(c.Commits))
 		}
 		fmt.Fprintln(w)
 	}
@@ -319,7 +366,7 @@ func Markdown(w io.Writer, rep *stats.Report, o Options) {
 			if i >= top {
 				break
 			}
-			fmt.Fprintf(w, "| `%s` | %s | %s | %s |\n", d.Path, commas(d.Lines), commas(d.AILines), Pct(d.AIShare))
+			fmt.Fprintf(w, "| %s | %s | %s | %s |\n", mdCode(d.Path), commas(d.Lines), commas(d.AILines), Pct(d.AIShare))
 		}
 		fmt.Fprintln(w)
 	}
@@ -330,7 +377,58 @@ func Markdown(w io.Writer, rep *stats.Report, o Options) {
 		}
 		fmt.Fprintln(w)
 	}
-	fmt.Fprintf(w, "<sub>Generated by <a href=\"https://github.com/trinhbentre/aiblame\">aiblame</a> %s · counts disclosed AI involvement only (trailers, agent identities, message markers)</sub>\n", rep.Version)
+	var notes []string
+	if len(rep.Provenance) > 0 {
+		var parts []string
+		for _, s := range rep.Provenance {
+			parts = append(parts, fmt.Sprintf("%s (%s commits)", s.Name, commas(s.Commits)))
+		}
+		notes = append(notes, "sidecar data read: "+strings.Join(parts, ", "))
+	}
+	if rep.LineLevelCommits > 0 {
+		notes = append(notes, fmt.Sprintf("%d commits attributed line by line from authorship logs", rep.LineLevelCommits))
+	}
+	if len(rep.Unrecognised) > 0 {
+		var parts []string
+		for _, u := range rep.Unrecognised {
+			parts = append(parts, fmt.Sprintf("%s (%s)", esc(u.Name), commas(u.Commits)))
+		}
+		notes = append(notes, "not counted, tool not recognised as an AI agent: "+strings.Join(parts, ", "))
+	}
+	for _, n := range notes {
+		fmt.Fprintf(w, "> %s\n", n)
+	}
+	if len(notes) > 0 {
+		fmt.Fprintln(w)
+	}
+	fmt.Fprintf(w, "<sub>Generated by <a href=\"https://github.com/trinhbentre/aiblame\">aiblame</a> %s · counts disclosed AI involvement only (trailers, agent identities, message markers, git-ai / Entire sidecar data)</sub>\n", rep.Version)
+}
+
+func survivalCell(s *float64) string {
+	if s == nil {
+		return "-"
+	}
+	return Pct(*s)
+}
+
+// survivalLine describes how much of the added code is still in the tree,
+// mentioning only the kinds that added anything.
+func survivalLine(rep *stats.Report) string {
+	s := rep.Survival
+	if s == nil {
+		return ""
+	}
+	var parts []string
+	if rep.Churn.AI > 0 {
+		parts = append(parts, fmt.Sprintf("%s of AI lines added", Pct(s.AI)))
+	}
+	if rep.Churn.Human > 0 {
+		parts = append(parts, fmt.Sprintf("%s of human lines added", Pct(s.Human)))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "Still in the tree: " + strings.Join(parts, ", ")
 }
 
 func mdTotals(w io.Writer, label string, t stats.Totals) {
@@ -338,8 +436,13 @@ func mdTotals(w io.Writer, label string, t stats.Totals) {
 }
 
 func esc(s string) string {
-	return strings.NewReplacer("|", "\\|", "<", "&lt;", ">", "&gt;").Replace(Sanitize(s))
+	return strings.NewReplacer("|", "\\|", "<", "&lt;", ">", "&gt;", "`", "'").Replace(Sanitize(s))
 }
+
+// mdCode renders untrusted text (a path from the analysed repository) as an
+// inline code span that cannot break out of the table cell: backticks,
+// pipes and angle brackets are neutralised first.
+func mdCode(s string) string { return "`" + esc(s) + "`" }
 
 func metricHeader(rep *stats.Report) string {
 	if rep.Metric == "churn" {

@@ -7,10 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 
 	"github.com/trinhbentre/aiblame/internal/attrib"
+	"github.com/trinhbentre/aiblame/internal/policy"
 )
 
 // FileName is the config file looked up at the repository root.
@@ -48,6 +50,14 @@ type Detect struct {
 	// CommitterEvidence treats an AI committer as evidence even when the
 	// author is human.
 	CommitterEvidence bool `toml:"committer_evidence"`
+	// Provenance reads git-ai notes, Entire checkpoints and similar sidecar
+	// data (default true).
+	Provenance *bool `toml:"provenance"`
+}
+
+// ProvenanceEnabled resolves the tri-state provenance option.
+func (d Detect) ProvenanceEnabled() bool {
+	return d.Provenance == nil || *d.Provenance
 }
 
 // AgentDef is a user-defined identity.
@@ -67,7 +77,17 @@ type Check struct {
 	Min                 *float64 `toml:"min"`
 	Metric              string   `toml:"metric"`
 	ForbidAgentAuthored bool     `toml:"forbid_agent_authored"`
-	RequireTrailer      string   `toml:"require_trailer"`
+	// RequireTrailer is one convention or a comma-separated list of
+	// alternatives ("assisted-by,generated-by").
+	RequireTrailer string `toml:"require_trailer"`
+	// ForbidTrailers lists conventions an AI-touched commit must not use
+	// (Mesa: co-authored-by; Kubernetes: every trailer).
+	ForbidTrailers []string `toml:"forbid_trailers"`
+	// ForbidAgentSignoff fails when a Signed-off-by names an AI identity.
+	ForbidAgentSignoff bool `toml:"forbid_agent_signoff"`
+	// Policy applies a named preset (kernel, mesa, llvm, asf, kubernetes, …)
+	// before the individual rules.
+	Policy string `toml:"policy"`
 }
 
 // Badge holds defaults for `aiblame badge`.
@@ -127,12 +147,33 @@ func (c *Config) validate() error {
 	default:
 		return fmt.Errorf("check.metric must be lines, churn or commits (got %q)", c.Check.Metric)
 	}
-	switch c.Check.RequireTrailer {
-	case "", "assisted-by", "co-authored-by", "generated-by", "coding-agent":
-	default:
-		return fmt.Errorf("check.require_trailer %q is not a known convention", c.Check.RequireTrailer)
+	for _, conv := range SplitConventions(c.Check.RequireTrailer) {
+		if !attrib.IsKnownConvention(conv) {
+			return fmt.Errorf("check.require_trailer %q is not a known convention", conv)
+		}
+	}
+	for _, conv := range c.Check.ForbidTrailers {
+		if !attrib.IsKnownConvention(conv) {
+			return fmt.Errorf("check.forbid_trailers %q is not a known convention", conv)
+		}
+	}
+	if c.Check.Policy != "" && policy.Find(c.Check.Policy) == nil {
+		return fmt.Errorf("check.policy %q is not a known preset (have %s)", c.Check.Policy, strings.Join(policy.Names(), ", "))
 	}
 	return nil
+}
+
+// SplitConventions splits "assisted-by, generated-by" into lower-case
+// convention names, dropping blanks.
+func SplitConventions(s string) []string {
+	var out []string
+	for _, c := range strings.Split(s, ",") {
+		c = strings.ToLower(strings.TrimSpace(c))
+		if c != "" {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // DefaultExcludesEnabled resolves the tri-state use_default_excludes option.
@@ -198,6 +239,9 @@ message_markers = []
 disable_message_markers = false
 # Count an AI *committer* as evidence even when the author is human.
 committer_evidence = false
+# Read attribution left by other tools: git-ai notes (refs/notes/ai),
+# Entire checkpoints (Entire-Checkpoint trailers), Exceeds Ink, Claudit.
+provenance = true
 
 # In-house agents. Matched case-insensitively against author and trailer
 # identities.
@@ -213,11 +257,16 @@ committer_evidence = false
 # emails = ["ci@acme.example"]
 
 [check]
+# Start from a project's published policy, then add rules below.
+# Presets: kernel, zephyr, mesa, openinfra, llvm, asf, fedora, artsy, kubernetes.
+# policy = "kernel"
 # Fail ` + "`aiblame check`" + ` when the AI share exceeds this percentage.
 # max = 60
 # metric = "lines"   # lines | churn | commits
 # forbid_agent_authored = false
-# require_trailer = "assisted-by"   # enforce one convention
+# forbid_agent_signoff = false      # DCO: an AI must not add Signed-off-by
+# require_trailer = "assisted-by"   # or "assisted-by,generated-by" (any of)
+# forbid_trailers = ["co-authored-by"]   # Mesa style: AI is not a co-author
 
 [badge]
 label = "AI-written"

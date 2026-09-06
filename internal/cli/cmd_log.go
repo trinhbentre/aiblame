@@ -8,6 +8,7 @@ import (
 
 	"github.com/trinhbentre/aiblame/internal/attrib"
 	"github.com/trinhbentre/aiblame/internal/render"
+	"github.com/trinhbentre/aiblame/internal/stats"
 )
 
 const logHelp = `Usage: aiblame log [PATH] [flags]
@@ -36,6 +37,7 @@ type logEntry struct {
 	Models      []string          `json:"models,omitempty"`
 	Conventions []string          `json:"conventions,omitempty"`
 	Evidence    []attrib.Evidence `json:"evidence,omitempty"`
+	Ignored     []attrib.Evidence `json:"ignored,omitempty"`
 	Merge       bool              `json:"merge,omitempty"`
 	Added       int               `json:"lines_added"`
 	Deleted     int               `json:"lines_deleted"`
@@ -99,7 +101,7 @@ func cmdLog(ctx context.Context, args []string, env Env) int {
 	if err != nil {
 		return fail(env, err)
 	}
-	if _, err := r.ResolveRev(ctx, an.Opts.Rev); err != nil {
+	if _, err := r.ResolveRev(ctx, stats.HeadOfRange(an.Opts.Rev)); err != nil {
 		return fail(env, err)
 	}
 	commits, err := an.Commits(ctx)
@@ -137,6 +139,7 @@ func cmdLog(ctx context.Context, args []string, env Env) int {
 		}
 		if *evidence || format == "json" {
 			e.Evidence = cc.Attr.Evidence
+			e.Ignored = cc.Attr.Ignored
 		}
 		for _, f := range cc.Files {
 			e.Added += f.Added
@@ -169,6 +172,9 @@ func cmdLog(ctx context.Context, args []string, env Env) int {
 		if *evidence {
 			for _, ev := range e.Evidence {
 				fmt.Fprintf(env.Stdout, "         └ %s: %s\n", ev.Source, render.Sanitize(ev.Value))
+			}
+			for _, ig := range e.Ignored {
+				fmt.Fprintf(env.Stdout, "         └ not counted %s: %s — %s\n", ig.Source, render.Sanitize(ig.Value), ig.Reason)
 			}
 		}
 	}

@@ -12,10 +12,14 @@ import (
 
 	"github.com/trinhbentre/aiblame/internal/attrib"
 	"github.com/trinhbentre/aiblame/internal/gitx"
+	"github.com/trinhbentre/aiblame/internal/provenance"
 )
 
 // Options controls an analysis run.
 type Options struct {
+	// Rev is the revision to analyse (default HEAD). A range "BASE..HEAD"
+	// restricts commits and churn to the range and surviving lines to those
+	// introduced by it — the shape of a pull request.
 	Rev              string
 	Since            string
 	Until            string
@@ -31,6 +35,12 @@ type Options struct {
 	Top              int // rows in agents/authors/dirs/files (0 = 10)
 	PathDepth        int // directory depth for Dirs (0 = 1)
 	Version          string
+	// Provenance reads attribution left by other tools (git-ai notes,
+	// Entire checkpoints) in addition to commit messages.
+	Provenance bool
+	// NoAuthors leaves the per-contributor table empty (privacy mode for
+	// shared reports).
+	NoAuthors bool
 	// Progress, when set, is called from the blame phase.
 	Progress func(done, total int)
 }
@@ -46,17 +56,43 @@ type Analyzer struct {
 	Runner     *gitx.Runner
 	Classifier *attrib.Classifier
 	Opts       Options
+	// ExtraAgents are user-defined identities, also used to canonicalise
+	// tool names found in sidecar data.
+	ExtraAgents []attrib.Identity
+
+	provOnce sync.Once
+	prov     *provenance.Store
+	provErr  error
+}
+
+// splitRange interprets Rev. "A..B" and "A...B" are ranges: commits come
+// from `git log A..B`, blame runs at B (HEAD when B is empty).
+func splitRange(rev string) (spec, head, base string, isRange bool) {
+	if rev == "" {
+		return "HEAD", "HEAD", "", false
+	}
+	i := strings.Index(rev, "..")
+	if i < 0 {
+		return rev, rev, "", false
+	}
+	base = rev[:i]
+	head = strings.TrimLeft(rev[i:], ".")
+	if head == "" {
+		head = "HEAD"
+	}
+	if base == "" {
+		base = "HEAD"
+	}
+	return rev, head, base, true
 }
 
 // Commits returns every commit reachable from Opts.Rev with its attribution,
 // newest first. Since/Until are NOT applied here so that blame can resolve
-// every hash; callers filter with InWindow.
+// every hash; callers filter with InWindow. When Opts.Provenance is set,
+// evidence from git-ai notes and Entire checkpoints is merged in.
 func (a *Analyzer) Commits(ctx context.Context) ([]ClassifiedCommit, error) {
-	rev := a.Opts.Rev
-	if rev == "" {
-		rev = "HEAD"
-	}
-	commits, err := a.Runner.Log(ctx, gitx.LogOptions{Rev: rev, NumStat: true})
+	spec, _, _, _ := splitRange(a.Opts.Rev)
+	commits, err := a.Runner.Log(ctx, gitx.LogOptions{Rev: spec, NumStat: true})
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +108,53 @@ func (a *Analyzer) Commits(ctx context.Context) ([]ClassifiedCommit, error) {
 		})
 		out = append(out, ClassifiedCommit{Commit: c, Attr: att})
 	}
+	if a.Opts.Provenance {
+		store, err := a.provenanceStore(ctx, out)
+		if err != nil {
+			return nil, err
+		}
+		for i := range out {
+			applyProvenance(&out[i].Attr, out[i].Hash, store)
+		}
+	}
 	return out, nil
+}
+
+// provenanceStore loads the sidecar data once per Analyzer.
+func (a *Analyzer) provenanceStore(ctx context.Context, commits []ClassifiedCommit) (*provenance.Store, error) {
+	a.provOnce.Do(func() {
+		var ids []string
+		for _, c := range commits {
+			for _, ev := range c.Attr.Evidence {
+				if ev.Source == provenance.EntireTrailerSource {
+					ids = append(ids, ev.Value)
+				}
+			}
+		}
+		a.prov, a.provErr = provenance.Load(ctx, a.Runner, provenance.Options{ExtraAgents: a.ExtraAgents, CheckpointIDs: ids})
+	})
+	return a.prov, a.provErr
+}
+
+// applyProvenance merges sidecar evidence into a commit's attribution.
+func applyProvenance(att *attrib.Attribution, hash string, store *provenance.Store) {
+	if store == nil {
+		return
+	}
+	if rec := store.ForCommit(hash); rec != nil {
+		for _, ev := range rec.Evidence {
+			att.Merge(ev, rec.Source)
+		}
+	}
+	for _, ev := range att.Evidence {
+		if ev.Source != provenance.EntireTrailerSource {
+			continue
+		}
+		if cp := store.Checkpoint(ev.Value); cp != nil && cp.Agent != "" {
+			att.SetAgent(provenance.EntireTrailerSource, cp.Agent, cp.Model)
+			break
+		}
+	}
 }
 
 // window is the parsed Since/Until bound, resolved through git so that
@@ -93,6 +175,8 @@ func (w window) contains(t time.Time) bool {
 	return true
 }
 
+func (w window) active() bool { return w.hasSince || w.hasUntil }
+
 func (a *Analyzer) resolveWindow(ctx context.Context) (window, error) {
 	var w window
 	if a.Opts.Since != "" {
@@ -112,10 +196,8 @@ func (a *Analyzer) resolveWindow(ctx context.Context) (window, error) {
 	return w, nil
 }
 
-// resolveDate uses git's approxidate parser via `git rev-parse`'s date
-// handling is not exposed; instead we accept RFC3339/YYYY-MM-DD directly and
-// fall back to `git log --since` semantics by asking git for the oldest
-// commit in range. Simpler: parse common layouts here.
+// resolveDate accepts RFC3339 / YYYY-MM-DD style layouts and the relative
+// form "N days|weeks|months|years ago".
 func (a *Analyzer) resolveDate(_ context.Context, s string) (time.Time, error) {
 	s = strings.TrimSpace(s)
 	for _, layout := range []string{time.RFC3339, "2006-01-02", "2006-01-02T15:04:05", "2006-01", "2006"} {
@@ -123,7 +205,6 @@ func (a *Analyzer) resolveDate(_ context.Context, s string) (time.Time, error) {
 			return t.UTC(), nil
 		}
 	}
-	// relative: "N days|weeks|months|years ago"
 	f := strings.Fields(strings.ToLower(s))
 	if len(f) == 3 && f[2] == "ago" {
 		var n int
@@ -160,16 +241,18 @@ func (a *Analyzer) Run(ctx context.Context) (*Report, error) {
 	if opts.Jobs <= 0 {
 		opts.Jobs = runtime.GOMAXPROCS(0)
 	}
-	rev := opts.Rev
-	if rev == "" {
-		rev = "HEAD"
-	}
-	hash, err := a.Runner.ResolveRev(ctx, rev)
+	spec, headRev, baseRev, isRange := splitRange(opts.Rev)
+	hash, err := a.Runner.ResolveRev(ctx, headRev)
 	if err != nil {
-		if rev == "HEAD" && !a.Runner.HasCommits(ctx) {
+		if headRev == "HEAD" && !a.Runner.HasCommits(ctx) {
 			return nil, fmt.Errorf("repository %s has no commits yet", a.Runner.Dir)
 		}
 		return nil, err
+	}
+	if isRange {
+		if _, err := a.Runner.ResolveRev(ctx, baseRev); err != nil {
+			return nil, err
+		}
 	}
 	win, err := a.resolveWindow(ctx)
 	if err != nil {
@@ -182,12 +265,15 @@ func (a *Analyzer) Run(ctx context.Context) (*Report, error) {
 		SchemaVer:   SchemaVersion,
 		Repo:        a.Runner.Dir,
 		Remote:      a.Runner.RemoteURL(ctx),
-		RevName:     rev,
+		RevName:     spec,
 		Rev:         hash,
 		GeneratedAt: time.Now().UTC(),
 		Since:       opts.Since,
 		Until:       opts.Until,
 		Includes:    opts.Include,
+	}
+	if isRange {
+		rep.BaseRev = baseRev
 	}
 	if a.Runner.IsShallow(ctx) {
 		rep.Warnings = append(rep.Warnings, "shallow clone: history is incomplete, so commit and line counts are understated (run `git fetch --unshallow`, or use fetch-depth: 0 in CI)")
@@ -216,12 +302,14 @@ func (a *Analyzer) Run(ctx context.Context) (*Report, error) {
 	}
 	byHash := make(map[string]*ClassifiedCommit, len(commits))
 	binaryPaths := map[string]bool{}
+	touched := map[string]bool{} // paths changed by in-range commits
 	agents := map[string]*AgentStat{}
 	authors := map[string]*AuthorStat{}
 	months := map[string]*MonthStat{}
 	convs := map[string]int64{}
 	churnByPath := map[string]*PathStat{}
 	agentModels := map[string]map[string]bool{}
+	unrecognised := map[string]int64{}
 
 	for i := range commits {
 		c := &commits[i]
@@ -230,6 +318,7 @@ func (a *Analyzer) Run(ctx context.Context) (*Report, error) {
 			if f.Binary {
 				binaryPaths[f.Path] = true
 			}
+			touched[f.Path] = true
 		}
 		if c.IsMerge() && !opts.IncludeMerges {
 			continue
@@ -295,8 +384,19 @@ func (a *Analyzer) Run(ctx context.Context) (*Report, error) {
 				convs["message-marker"]++
 			}
 		}
+		for _, ig := range c.Attr.Ignored {
+			if ig.Reason == attrib.ReasonUnrecognisedTool {
+				name := attrib.ParseAgentRef(ig.Value).Tool
+				if name == "" {
+					name = ig.Value
+				}
+				if attrib.IsToolLikeName(name) {
+					unrecognised[name]++
+				}
+			}
+		}
 
-		if k == attrib.Human || k == attrib.Assisted {
+		if !opts.NoAuthors && (k == attrib.Human || k == attrib.Assisted) {
 			key := strings.ToLower(c.AuthorEmail)
 			if key == "" {
 				key = strings.ToLower(c.AuthorName)
@@ -317,6 +417,17 @@ func (a *Analyzer) Run(ctx context.Context) (*Report, error) {
 	rep.Commits.Finalize()
 	rep.Churn.Finalize()
 
+	// ---- provenance summary ----------------------------------------------
+	store := a.prov
+	if opts.Provenance && store != nil {
+		for name, n := range store.Sources {
+			rep.Provenance = append(rep.Provenance, NameCount{Name: name, Commits: int64(n)})
+		}
+		rep.LineLevelCommits = store.LineLevelCommits()
+		rep.Warnings = append(rep.Warnings, store.Warnings...)
+	}
+	lineLevel := opts.Provenance && store.HasLineLevel()
+
 	// ---- blame ------------------------------------------------------------
 	if opts.Blame {
 		sizes, err := a.Runner.FileSizes(ctx, hash)
@@ -328,6 +439,9 @@ func (a *Analyzer) Run(ctx context.Context) (*Report, error) {
 			if !counted(p) {
 				continue
 			}
+			if isRange && !touched[p] {
+				continue
+			}
 			if binaryPaths[p] || BinaryExtensions[strings.ToLower(path.Ext(p))] || sz > opts.MaxFileSize || sz == 0 {
 				rep.SkippedFiles++
 				continue
@@ -337,7 +451,7 @@ func (a *Analyzer) Run(ctx context.Context) (*Report, error) {
 		sort.Strings(files)
 		rep.FileCount = len(files)
 
-		bopts := gitx.BlameOptions{Rev: hash, IgnoreWhitespace: opts.IgnoreWhitespace}
+		bopts := gitx.BlameOptions{Rev: hash, IgnoreWhitespace: opts.IgnoreWhitespace, Detail: lineLevel}
 		if !opts.NoIgnoreRevs {
 			bopts.IgnoreRevsFile = a.Runner.IgnoreRevsFile()
 		}
@@ -355,6 +469,46 @@ func (a *Analyzer) Run(ctx context.Context) (*Report, error) {
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
+		// account credits n surviving lines of a file to commit h. When
+		// override is set the line's kind comes from a line-level authorship
+		// log rather than from the commit. The caller holds mu.
+		account := func(ps *PathStat, h string, n int64, override *attrib.Kind) {
+			cc, ok := byHash[h]
+			if !ok && isRange {
+				return // a line older than the range: not part of this change
+			}
+			k := attrib.Human
+			var agentNames []string
+			if ok {
+				k = cc.Attr.Kind
+				agentNames = cc.Attr.Agents
+				if override != nil {
+					k = *override
+					if !k.IsAI() {
+						agentNames = nil
+					}
+				}
+				if !opts.NoAuthors && (k == attrib.Human || k == attrib.Assisted) {
+					key := strings.ToLower(cc.AuthorEmail)
+					if key == "" {
+						key = strings.ToLower(cc.AuthorName)
+					}
+					v := authorLines[key]
+					v[0] += n
+					if k == attrib.Assisted {
+						v[1] += n
+					}
+					authorLines[key] = v
+				}
+			}
+			lines.Add(k, n)
+			ps.Lines += n
+			addPathKind(ps, k, n)
+			for _, an := range agentNames {
+				agentLines[an] += n
+			}
+		}
+
 		for _, p := range files {
 			p := p
 			wg.Add(1)
@@ -366,6 +520,28 @@ func (a *Analyzer) Run(ctx context.Context) (*Report, error) {
 					return
 				}
 				res, err := a.Runner.Blame(ctx, p, bopts)
+				// Aggregate per (commit, kind override) outside the lock; byHash
+				// and store are read-only during the blame phase.
+				type group struct {
+					hash     string
+					override int // -1 = inherit the commit's kind
+				}
+				local := map[group]int64{}
+				if err == nil {
+					if lineLevel && len(res.Lines) > 0 {
+						for _, l := range res.Lines {
+							g := group{hash: l.Hash, override: -1}
+							if k := lineKind(store, byHash[l.Hash], l, p); k != nil {
+								g.override = int(*k)
+							}
+							local[g]++
+						}
+					} else {
+						for h, n := range res.Counts {
+							local[group{hash: h, override: -1}] = int64(n)
+						}
+					}
+				}
 				mu.Lock()
 				defer mu.Unlock()
 				done++
@@ -390,31 +566,13 @@ func (a *Analyzer) Run(ctx context.Context) (*Report, error) {
 				}
 				ps := &PathStat{Path: p}
 				linesByPath[p] = ps
-				for h, n := range res.Counts {
-					k := attrib.Human
-					var agentNames []string
-					if cc, ok := byHash[h]; ok {
-						k = cc.Attr.Kind
-						agentNames = cc.Attr.Agents
-						if k == attrib.Human || k == attrib.Assisted {
-							key := strings.ToLower(cc.AuthorEmail)
-							if key == "" {
-								key = strings.ToLower(cc.AuthorName)
-							}
-							v := authorLines[key]
-							v[0] += int64(n)
-							if k == attrib.Assisted {
-								v[1] += int64(n)
-							}
-							authorLines[key] = v
-						}
+				for g, n := range local {
+					var override *attrib.Kind
+					if g.override >= 0 {
+						k := attrib.Kind(g.override)
+						override = &k
 					}
-					lines.Add(k, int64(n))
-					ps.Lines += int64(n)
-					addPathKind(ps, k, int64(n))
-					for _, an := range agentNames {
-						agentLines[an] += int64(n)
-					}
+					account(ps, g.hash, n, override)
 				}
 			}()
 		}
@@ -445,6 +603,19 @@ func (a *Analyzer) Run(ctx context.Context) (*Report, error) {
 		rep.Dirs, rep.Files = pathStats(linesByPath, opts.PathDepth, opts.Top)
 		rep.Metric = "lines"
 		rep.Headline = lines.AIShare
+		if !win.active() {
+			rep.Survival = &Survival{
+				AI:    survival(lines.AI, rep.Churn.AI),
+				Human: survival(lines.Human, rep.Churn.Human),
+				All:   survival(lines.AI+lines.Human, rep.Churn.AI+rep.Churn.Human),
+			}
+			for _, as := range agents {
+				if as.Churn > 0 && as.Lines > 0 {
+					s := survival(as.Lines, as.Churn)
+					as.Survival = &s
+				}
+			}
+		}
 	} else {
 		rep.Dirs, rep.Files = pathStats(churnByPath, opts.PathDepth, opts.Top)
 		rep.Metric = "churn"
@@ -485,6 +656,14 @@ func (a *Analyzer) Run(ctx context.Context) (*Report, error) {
 		}
 		return rep.Conventions[i].Name < rep.Conventions[j].Name
 	})
+	for name, n := range unrecognised {
+		rep.Unrecognised = append(rep.Unrecognised, NameCount{Name: name, Commits: n})
+	}
+	sortNameCounts(rep.Unrecognised)
+	if len(rep.Unrecognised) > opts.Top {
+		rep.Unrecognised = rep.Unrecognised[:opts.Top]
+	}
+	sortNameCounts(rep.Provenance)
 
 	for _, ms := range months {
 		ms.AIShare = share(ms.AIChurn, ms.Churn-ms.AIChurn)
@@ -510,8 +689,78 @@ func (a *Analyzer) Run(ctx context.Context) (*Report, error) {
 	if rep.Files == nil {
 		rep.Files = []PathStat{}
 	}
+	if rep.Provenance == nil {
+		rep.Provenance = []NameCount{}
+	}
+	if rep.Unrecognised == nil {
+		rep.Unrecognised = []NameCount{}
+	}
 	rep.DurationMS = time.Since(start).Milliseconds()
 	return rep, nil
+}
+
+// lineKind decides the kind of one surviving line when a line-level
+// authorship log exists for its commit. It returns nil to inherit the
+// commit's kind. Lines the log does not mention are "untracked": they stay
+// human unless the commit has other AI evidence (a trailer, an agent
+// author), in which case the commit's kind applies.
+func lineKind(store *provenance.Store, cc *ClassifiedCommit, l gitx.BlameLine, currentPath string) *attrib.Kind {
+	if cc == nil {
+		return nil
+	}
+	rec := store.ForCommit(l.Hash)
+	if !rec.LineLevel() {
+		return nil
+	}
+	fa := rec.Files[l.OrigPath]
+	if fa == nil {
+		fa = rec.Files[currentPath]
+	}
+	// A file the log does not mention is untracked as a whole.
+	ai, known := fa.Kind(l.OrigLine)
+	switch {
+	case known && ai:
+		k := attrib.Assisted
+		if cc.Attr.Kind == attrib.Agent {
+			k = attrib.Agent
+		}
+		return &k
+	case known:
+		k := attrib.Human
+		return &k
+	}
+	if onlySidecarEvidence(cc.Attr) {
+		k := attrib.Human
+		return &k
+	}
+	return nil
+}
+
+// onlySidecarEvidence reports whether every piece of AI evidence on the
+// commit came from an authorship log (no trailer, marker or identity).
+func onlySidecarEvidence(att attrib.Attribution) bool {
+	if !att.Kind.IsAI() {
+		return false
+	}
+	for _, ev := range att.Evidence {
+		if !strings.HasPrefix(ev.Source, "notes:") && ev.Source != "refs/ai/authorship" {
+			return false
+		}
+	}
+	return true
+}
+
+// survival is surviving/added as a percentage, capped at 100 (renames and
+// ignore-revs can make blame attribute more lines than numstat counted).
+func survival(surviving, added int64) float64 {
+	if added <= 0 {
+		return 0
+	}
+	s := float64(surviving) * 100 / float64(added)
+	if s > 100 {
+		s = 100
+	}
+	return s
 }
 
 func addPathKind(ps *PathStat, k attrib.Kind, n int64) {
@@ -576,12 +825,19 @@ func dirKey(p string, depth int) string {
 }
 
 func vendorOf(agent string) string {
-	for _, id := range attrib.KnownAgents {
-		if id.Name == agent {
-			return id.Vendor
-		}
+	if id := attrib.AgentByName(agent); id != nil {
+		return id.Vendor
 	}
 	return ""
+}
+
+func sortNameCounts(s []NameCount) {
+	sort.Slice(s, func(i, j int) bool {
+		if s[i].Commits != s[j].Commits {
+			return s[i].Commits > s[j].Commits
+		}
+		return s[i].Name < s[j].Name
+	})
 }
 
 func shortErr(err error) string {
@@ -593,6 +849,25 @@ func shortErr(err error) string {
 		s = s[:160] + "…"
 	}
 	return s
+}
+
+// Provenance returns the sidecar store loaded by Commits (nil before Commits
+// has run or when Opts.Provenance is off).
+func (a *Analyzer) Provenance() *provenance.Store { return a.prov }
+
+// LineKind exposes the line-level rule used by Run for `aiblame blame`.
+func LineKind(store *provenance.Store, cc *ClassifiedCommit, l gitx.BlameLine, currentPath string) *attrib.Kind {
+	if store == nil {
+		return nil
+	}
+	return lineKind(store, cc, l, currentPath)
+}
+
+// HeadOfRange returns the revision blame runs at: the right side of a
+// "BASE..HEAD" range, or rev itself.
+func HeadOfRange(rev string) string {
+	_, head, _, _ := splitRange(rev)
+	return head
 }
 
 // InWindow reports whether the commit falls inside Since/Until, using the

@@ -55,8 +55,32 @@ func TestTrailer(t *testing.T) {
 	if got := Trailer(Detected{Agent: "X"}, CoAuthoredBy); got != "Assisted-by: X" {
 		t.Errorf("no e-mail should fall back: %s", got)
 	}
+	// Kernel 7.3+ drops tool and model names; Zephyr / kernel 7.0 use Agent:model.
+	if got := Trailer(d, Kernel); got != "Assisted-by: LLM" {
+		t.Error(got)
+	}
+	if got := Trailer(d, AgentModel); got != "Assisted-by: Claude Code:m1" {
+		t.Error(got)
+	}
+	if got := Trailer(Detected{Agent: "Codex"}, AgentModel); got != "Assisted-by: Codex" {
+		t.Error(got)
+	}
+	if st, err := ParseStyle("zephyr"); err != nil || st != AgentModel {
+		t.Errorf("zephyr alias: %v %v", st, err)
+	}
 	if _, err := ParseStyle("bogus"); err == nil {
 		t.Error("expected style error")
+	}
+	for _, st := range Styles {
+		if !strings.Contains(Script(st), "# Style: "+string(st)+".") {
+			t.Errorf("script for %s lacks its style marker", st)
+		}
+	}
+	if !strings.Contains(Script(Kernel), `trailer="Assisted-by: LLM"`) {
+		t.Error("kernel script should write the generic LLM tag")
+	}
+	if !strings.Contains(Script(AssistedBy), "claude-session|amp-thread-id|agent-logs-url") {
+		t.Error("script should skip commits that already carry a session trailer")
 	}
 }
 

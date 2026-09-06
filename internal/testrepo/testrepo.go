@@ -55,6 +55,87 @@ func (r *Repo) git(extraEnv []string, args ...string) string {
 	return string(out)
 }
 
+// GitStdin runs a git command with stdin and returns its stdout.
+func (r *Repo) GitStdin(stdin string, args ...string) string {
+	r.T.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = r.Dir
+	cmd.Env = append(os.Environ(),
+		"GIT_COMMITTER_NAME=Test Human",
+		"GIT_COMMITTER_EMAIL=human@example.com",
+		"GIT_AUTHOR_NAME=Test Human",
+		"GIT_AUTHOR_EMAIL=human@example.com",
+	)
+	cmd.Stdin = strings.NewReader(stdin)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		r.T.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out)
+}
+
+// Blob writes content as a blob object and returns its id.
+func (r *Repo) Blob(content string) string {
+	r.T.Helper()
+	return strings.TrimSpace(r.GitStdin(content, "hash-object", "-w", "--stdin"))
+}
+
+// Tree writes a tree from repo-relative paths (forward slashes) to file
+// contents, creating sub-trees as needed, and returns the tree id.
+func (r *Repo) Tree(files map[string]string) string {
+	r.T.Helper()
+	type node struct {
+		files map[string]string
+		dirs  map[string]*node
+	}
+	root := &node{files: map[string]string{}, dirs: map[string]*node{}}
+	for p, content := range files {
+		parts := strings.Split(p, "/")
+		n := root
+		for _, d := range parts[:len(parts)-1] {
+			child := n.dirs[d]
+			if child == nil {
+				child = &node{files: map[string]string{}, dirs: map[string]*node{}}
+				n.dirs[d] = child
+			}
+			n = child
+		}
+		n.files[parts[len(parts)-1]] = content
+	}
+	var write func(n *node) string
+	write = func(n *node) string {
+		var b strings.Builder
+		for name, content := range n.files {
+			b.WriteString("100644 blob " + r.Blob(content) + "\t" + name + "\n")
+		}
+		for name, child := range n.dirs {
+			b.WriteString("040000 tree " + write(child) + "\t" + name + "\n")
+		}
+		return strings.TrimSpace(r.GitStdin(b.String(), "mktree"))
+	}
+	return write(root)
+}
+
+// CommitTree creates a root commit from a tree and returns its id. It does
+// not move any branch; pair it with update-ref.
+func (r *Repo) CommitTree(tree, message string) string {
+	r.T.Helper()
+	r.tick++
+	ts := CommitTime(r.tick).Format(time.RFC3339)
+	cmd := exec.Command("git", "commit-tree", tree, "-m", message)
+	cmd.Dir = r.Dir
+	cmd.Env = append(os.Environ(),
+		"GIT_COMMITTER_NAME=Test Human", "GIT_COMMITTER_EMAIL=human@example.com",
+		"GIT_AUTHOR_NAME=Test Human", "GIT_AUTHOR_EMAIL=human@example.com",
+		"GIT_AUTHOR_DATE="+ts, "GIT_COMMITTER_DATE="+ts,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		r.T.Fatalf("git commit-tree: %v\n%s", err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // CommitTime returns the deterministic timestamp of the n-th commit (1-based):
 // 2026-01-01T00:00Z plus n hours.
 func CommitTime(n int) time.Time {

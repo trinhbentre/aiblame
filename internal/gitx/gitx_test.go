@@ -147,14 +147,99 @@ func TestLogAndBlameIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(bl.Lines) != 30 || len(bl.Counts) != 1 {
-		t.Fatalf("blame = %d lines, %d commits", len(bl.Lines), len(bl.Counts))
+	total := 0
+	for _, n := range bl.Counts {
+		total += n
+	}
+	// Aggregate blame keeps only the per-commit counts, not every line.
+	if total != 30 || len(bl.Counts) != 1 || len(bl.Lines) != 0 {
+		t.Fatalf("blame = %d lines kept, %v", len(bl.Lines), bl.Counts)
 	}
 	if _, err := r.ResolveRev(ctx, "nope-not-a-rev"); err == nil {
 		t.Fatal("expected error for bad rev")
 	}
 	if _, err := Open(ctx, t.TempDir()); err == nil {
 		t.Fatal("expected not-a-repo error")
+	}
+}
+
+func TestBlameDetailKeepsOriginalLines(t *testing.T) {
+	repo := testrepo.Standard(t)
+	ctx := context.Background()
+	r, err := Open(ctx, repo.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bl, err := r.Blame(ctx, "src/ai.go", BlameOptions{Detail: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bl.Lines) != 30 {
+		t.Fatalf("lines = %d", len(bl.Lines))
+	}
+	for i, l := range bl.Lines {
+		if l.OrigLine != i+1 || l.OrigPath != "src/ai.go" || l.Content != "" {
+			t.Fatalf("line %d = %+v", i+1, l)
+		}
+	}
+	// Without Detail only the counts are kept.
+	bl, err = r.Blame(ctx, "src/ai.go", BlameOptions{})
+	if err != nil || len(bl.Lines) != 0 || len(bl.Counts) != 1 {
+		t.Fatalf("plain blame: lines=%d counts=%v err=%v", len(bl.Lines), bl.Counts, err)
+	}
+}
+
+func TestNotesRefsAndCatFile(t *testing.T) {
+	repo := testrepo.Standard(t)
+	ctx := context.Background()
+	r, err := Open(ctx, repo.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := strings.TrimSpace(repo.Git("rev-parse", "HEAD"))
+	// No notes yet: empty map, no error, ref does not exist.
+	if r.RefExists(ctx, "refs/notes/ai") {
+		t.Fatal("refs/notes/ai should not exist yet")
+	}
+	notes, err := r.NotesList(ctx, "ai")
+	if err != nil || len(notes) != 0 {
+		t.Fatalf("empty notes = %v err=%v", notes, err)
+	}
+	repo.Git("notes", "--ref=ai", "add", "-m", "src/a.go\n  h_1 1-2\n---\n{}", "HEAD")
+	notes, err = r.NotesList(ctx, "ai")
+	if err != nil || len(notes) != 1 || notes[head] == "" {
+		t.Fatalf("notes = %v err=%v", notes, err)
+	}
+	blobs, err := r.CatFileBatch(ctx, []string{notes[head], "refs/notes/ai:" + head, "HEAD:src/ai.go", "HEAD:does/not/exist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(blobs[notes[head]]), "h_1 1-2") {
+		t.Fatalf("note blob = %q", blobs[notes[head]])
+	}
+	if !contains(string(blobs["refs/notes/ai:"+head]), "h_1 1-2") {
+		t.Fatalf("note via path spec = %q", blobs["refs/notes/ai:"+head])
+	}
+	if !contains(string(blobs["HEAD:src/ai.go"]), "ai line 1") {
+		t.Fatalf("file blob = %q", blobs["HEAD:src/ai.go"])
+	}
+	if _, ok := blobs["HEAD:does/not/exist"]; ok {
+		t.Fatal("missing object should be absent, not present")
+	}
+	// Loose refs (git-ai's refs/ai/authorship/<sha>, Entire's refs/entire/…).
+	repo.Git("update-ref", "refs/ai/authorship/"+head, notes[head])
+	refs, err := r.ForEachRef(ctx, "refs/ai/", "refs/notes/")
+	if err != nil || len(refs) != 2 {
+		t.Fatalf("refs = %+v err=%v", refs, err)
+	}
+	if refs[0].Name != "refs/ai/authorship/"+head || refs[0].Type != "blob" {
+		t.Fatalf("ref0 = %+v", refs[0])
+	}
+	if _, err := r.CatFileBatch(ctx, []string{"--help"}); err == nil {
+		t.Fatal("option-like spec must be rejected")
+	}
+	if _, err := r.ForEachRef(ctx, "--format=x"); err == nil {
+		t.Fatal("option-like prefix must be rejected")
 	}
 }
 

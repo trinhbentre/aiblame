@@ -10,6 +10,7 @@ import (
 	"github.com/trinhbentre/aiblame/internal/attrib"
 	"github.com/trinhbentre/aiblame/internal/gitx"
 	"github.com/trinhbentre/aiblame/internal/render"
+	"github.com/trinhbentre/aiblame/internal/stats"
 )
 
 const blameHelp = `Usage: aiblame blame FILE [flags]
@@ -80,7 +81,7 @@ func cmdBlame(ctx context.Context, args []string, env Env) int {
 	if err != nil {
 		return fail(env, err)
 	}
-	hash, err := r.ResolveRev(ctx, an.Opts.Rev)
+	hash, err := r.ResolveRev(ctx, stats.HeadOfRange(an.Opts.Rev))
 	if err != nil {
 		return fail(env, err)
 	}
@@ -88,11 +89,10 @@ func cmdBlame(ctx context.Context, args []string, env Env) int {
 	if err != nil {
 		return fail(env, err)
 	}
-	byHash := map[string]*attrib.Attribution{}
-	authorOf := map[string]string{}
+	store := an.Provenance()
+	byHash := map[string]*stats.ClassifiedCommit{}
 	for i := range commits {
-		byHash[commits[i].Hash] = &commits[i].Attr
-		authorOf[commits[i].Hash] = commits[i].AuthorName
+		byHash[commits[i].Hash] = &commits[i]
 	}
 	bopts := gitx.BlameOptions{Rev: hash, IgnoreWhitespace: c.ignoreWS, Content: true}
 	if !c.noIgnoreRevs {
@@ -106,13 +106,22 @@ func cmdBlame(ctx context.Context, args []string, env Env) int {
 	var totals [4]int
 	for _, l := range res.Lines {
 		k := attrib.Human
-		agent := ""
-		if a := byHash[l.Hash]; a != nil {
-			k = a.Kind
-			agent = a.PrimaryAgent()
+		agent, author := "", ""
+		if cc := byHash[l.Hash]; cc != nil {
+			k = cc.Attr.Kind
+			agent = cc.Attr.PrimaryAgent()
+			author = cc.AuthorName
+			// A git-ai authorship log knows which lines of the commit the
+			// agent wrote; use it when present.
+			if ov := stats.LineKind(store, cc, l, rel); ov != nil {
+				k = *ov
+				if !k.IsAI() {
+					agent = ""
+				}
+			}
 		}
 		totals[k]++
-		out = append(out, blameLineOut{Line: l.LineNo, Hash: l.Hash, Kind: k, Agent: agent, Author: authorOf[l.Hash], Content: l.Content})
+		out = append(out, blameLineOut{Line: l.LineNo, Hash: l.Hash, Kind: k, Agent: agent, Author: author, Content: l.Content})
 	}
 	ai := totals[attrib.Assisted] + totals[attrib.Agent]
 	den := ai + totals[attrib.Human]

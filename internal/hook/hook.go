@@ -31,19 +31,28 @@ const (
 	CoAuthoredBy Style = "co-authored-by"
 	// GeneratedBy writes "Generated-by: <agent> (model: <model>)".
 	GeneratedBy Style = "generated-by"
+	// Kernel writes "Assisted-by: LLM", the form the Linux kernel adopted in
+	// 7.3 (July 2026) after dropping tool and model names from the tag.
+	Kernel Style = "kernel"
+	// AgentModel writes "Assisted-by: <agent>:<model>", the kernel-7.0 /
+	// Zephyr form.
+	AgentModel Style = "agent-model"
 )
+
+// Styles lists every style ParseStyle accepts.
+var Styles = []Style{AssistedBy, CoAuthoredBy, GeneratedBy, Kernel, AgentModel}
 
 // ParseStyle validates a style string.
 func ParseStyle(s string) (Style, error) {
-	switch Style(strings.ToLower(strings.TrimSpace(s))) {
-	case "", AssistedBy:
+	switch st := Style(strings.ToLower(strings.TrimSpace(s))); st {
+	case "":
 		return AssistedBy, nil
-	case CoAuthoredBy:
-		return CoAuthoredBy, nil
-	case GeneratedBy:
-		return GeneratedBy, nil
+	case AssistedBy, CoAuthoredBy, GeneratedBy, Kernel, AgentModel:
+		return st, nil
+	case "zephyr":
+		return AgentModel, nil
 	}
-	return "", fmt.Errorf("unknown style %q (want assisted-by, co-authored-by or generated-by)", s)
+	return "", fmt.Errorf("unknown style %q (want assisted-by, co-authored-by, generated-by, kernel or agent-model)", s)
 }
 
 // Marker identifies hooks written by aiblame.
@@ -120,6 +129,13 @@ func Trailer(d Detected, style Style) string {
 			return fmt.Sprintf("Generated-by: %s (model: %s)", agent, d.Model)
 		}
 		return fmt.Sprintf("Generated-by: %s", agent)
+	case Kernel:
+		return "Assisted-by: LLM"
+	case AgentModel:
+		if d.Model != "" {
+			return fmt.Sprintf("Assisted-by: %s:%s", agent, d.Model)
+		}
+		return fmt.Sprintf("Assisted-by: %s", agent)
 	default:
 		if d.Model != "" {
 			return fmt.Sprintf("Assisted-by: %s (%s)", agent, d.Model)
@@ -153,7 +169,8 @@ if [ -n "${AIBLAME_AGENT:-}" ]; then
 fi
 [ -z "$agent" ] && exit 0
 # Do not add a second trailer when the agent already disclosed itself.
-if grep -qiE '^(assisted-by|generated-by|generated-with|coding-agent|ai-agent|ai-assistant|ai-assisted-by):' "$msgfile" 2>/dev/null; then exit 0; fi
+if grep -qiE '^(assisted-by|generated-by|generated-with|coding-agent|ai-agent|ai-assistant|ai-assisted-by|ai-used-for|claude-session|amp-thread-id|agent-logs-url):' "$msgfile" 2>/dev/null; then exit 0; fi
+if grep -qiE '^made-with:[[:space:]]*cursor' "$msgfile" 2>/dev/null; then exit 0; fi
 if grep -qiE '^co-authored-by:.*(noreply@anthropic\.com|noreply@openai\.com|cursoragent@cursor\.com|copilot(\[bot\])?@users\.noreply\.github\.com|noreply@aider\.chat|noreply@opencode\.ai|@ampcode\.com|gemini-cli@google\.com)' "$msgfile" 2>/dev/null; then exit 0; fi
 `)
 	switch style {
@@ -171,6 +188,16 @@ fi
   trailer="Generated-by: $agent (model: $model)"
 else
   trailer="Generated-by: $agent"
+fi
+`)
+	case Kernel:
+		b.WriteString(`trailer="Assisted-by: LLM"
+`)
+	case AgentModel:
+		b.WriteString(`if [ -n "$model" ]; then
+  trailer="Assisted-by: $agent:$model"
+else
+  trailer="Assisted-by: $agent"
 fi
 `)
 	default:
@@ -270,7 +297,7 @@ func Inspect(ctx context.Context, r *gitx.Runner) (Status, error) {
 	st.Installed = true
 	s := string(b)
 	st.Managed = strings.Contains(s, Marker)
-	for _, sty := range []Style{AssistedBy, CoAuthoredBy, GeneratedBy} {
+	for _, sty := range Styles {
 		if strings.Contains(s, "# Style: "+string(sty)+".") {
 			st.Style = sty
 		}

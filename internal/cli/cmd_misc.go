@@ -68,12 +68,29 @@ func cmdAgents(_ context.Context, args []string, env Env) int {
 		}
 		fmt.Fprintf(env.Stdout, "%-18s %s\n", r.Name, matchedBy(r.Emails, r.Suffixes, r.Names, r.Pattern))
 	}
-	keys := make([]string, 0, len(attrib.AITrailerKeys))
-	for k := range attrib.AITrailerKeys {
-		keys = append(keys, k)
+	sortedKeys := func(m map[string]bool) string {
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		return strings.Join(keys, ", ")
 	}
-	sort.Strings(keys)
-	fmt.Fprintln(env.Stdout, "\nTrailer keys treated as AI evidence:", strings.Join(keys, ", "))
+	sessionKeys := make([]string, 0, len(attrib.SessionTrailerKeys))
+	for k := range attrib.SessionTrailerKeys {
+		sessionKeys = append(sessionKeys, k)
+	}
+	sort.Strings(sessionKeys)
+	fmt.Fprintln(env.Stdout, "\nTrailer keys that disclose AI on their own (unless they name a person or say \"none\"):")
+	fmt.Fprintln(env.Stdout, "  "+sortedKeys(attrib.StrongTrailerKeys))
+	fmt.Fprintln(env.Stdout, "Trailer keys counted only when the value names a known agent or uses AI vocabulary:")
+	fmt.Fprintln(env.Stdout, "  "+sortedKeys(attrib.WeakTrailerKeys))
+	fmt.Fprintln(env.Stdout, "Session-link trailers (the key identifies the agent):")
+	fmt.Fprintln(env.Stdout, "  "+strings.Join(sessionKeys, ", "))
+	fmt.Fprintln(env.Stdout, "Co-authored-by / Co-developed-by count when the person is a known agent;")
+	fmt.Fprintln(env.Stdout, "Signed-off-by naming an agent counts and is flagged for DCO checks.")
+	fmt.Fprintln(env.Stdout, "\nSidecar data read when present: refs/notes/ai and refs/ai/authorship/* (git-ai),")
+	fmt.Fprintln(env.Stdout, "refs/notes/exceeds-ink, refs/notes/claude-conversations, refs/entire/checkpoints/* (Entire).")
 	return ExitOK
 }
 

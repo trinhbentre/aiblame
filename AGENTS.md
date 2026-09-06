@@ -28,7 +28,7 @@ go vet ./... && gofmt -l .      # must be clean
 
 ## Rules
 
-- Never invent attribution. A commit is AI-touched only with disclosure evidence. Prefer a miss over a false positive.
+- Never invent attribution. A commit is AI-touched only with disclosure evidence. Prefer a miss over a false positive. When a detection rule changes, re-run `./aiblame stats` on a repository that exercises it (curl for human `Assisted-by`, entireio/cli for Entire checkpoints, git-ai-project/git-ai for authorship notes) before shipping.
 - Keep zero-setup: no databases, daemons, editor hooks or tokens for the basic report.
 - JSON field names are a contract. Add fields freely; renaming or removing bumps `stats.SchemaVersion`.
 - Tests must pass on Linux, macOS and Windows. Use `filepath` for local paths and forward slashes for repo-relative paths.

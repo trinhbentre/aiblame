@@ -100,6 +100,7 @@ Copilot SWE agent, Jules) and "Generated with …" message markers.
 
 Usage:
   aiblame [stats] [PATH|URL|owner/repo] [flags]   Full report (default command)
+                                                  (also host/owner/repo for GitLab, Codeberg…)
   aiblame blame FILE [flags]                      Per-line AI/human view of a file
   aiblame log [flags]                             Commits with their AI classification
   aiblame badge [flags]                           SVG badge / shields.io endpoint JSON
@@ -112,7 +113,8 @@ Usage:
   aiblame version
 
 Common flags (stats, badge, check, log):
-  --rev REV              Revision to analyse (default HEAD)
+  --rev REV              Revision to analyse (default HEAD). A range BASE..HEAD
+                         reports only what the range introduced (a PR)
   --since DATE           Only count commits after DATE (YYYY-MM-DD or "6 months ago")
   --until DATE           Only count commits before DATE
   --no-blame             Skip git blame; use lines added instead of surviving lines
@@ -123,6 +125,8 @@ Common flags (stats, badge, check, log):
   -w, --ignore-whitespace  Pass -w to git blame
   --no-ignore-revs       Do not honour .git-blame-ignore-revs
   --include-merges       Count merge commits
+  --no-provenance        Ignore git-ai notes, Entire checkpoints and other sidecar data
+  --no-authors           Leave out the per-contributor table
   --top N                Rows per section (default 10)
   --depth N              Directory depth for the per-directory table (default 1)
   --max-file-size BYTES  Skip larger blobs (default 1 MiB)
@@ -155,6 +159,8 @@ type common struct {
 	ignoreWS          bool
 	noIgnoreRevs      bool
 	includeMerges     bool
+	noProvenance      bool
+	noAuthors         bool
 	top               int
 	depth             int
 	maxFileSize       int64
@@ -180,6 +186,8 @@ func (c *common) bind(fs *flag.FlagSet) {
 	fs.BoolVar(&c.ignoreWS, "w", false, "pass -w to git blame")
 	fs.BoolVar(&c.noIgnoreRevs, "no-ignore-revs", false, "do not honour .git-blame-ignore-revs")
 	fs.BoolVar(&c.includeMerges, "include-merges", false, "count merge commits")
+	fs.BoolVar(&c.noProvenance, "no-provenance", false, "ignore sidecar attribution data")
+	fs.BoolVar(&c.noAuthors, "no-authors", false, "omit the contributor table")
 	fs.IntVar(&c.top, "top", 10, "rows per section")
 	fs.IntVar(&c.depth, "depth", 1, "directory depth")
 	fs.Int64Var(&c.maxFileSize, "max-file-size", 0, "skip blobs larger than this many bytes")
@@ -318,10 +326,37 @@ func remoteURL(s string) (string, bool) {
 		}
 	}
 	parts := strings.Split(strings.TrimSuffix(s, ".git"), "/")
-	if len(parts) == 2 && parts[0] != "" && parts[1] != "" && !strings.ContainsAny(s, " \\:") && parts[0] != "." && parts[0] != ".." {
+	if strings.ContainsAny(s, " \\:") {
+		return "", false
+	}
+	for _, p := range parts {
+		if p == "" || p == "." || p == ".." || strings.HasPrefix(p, "-") {
+			return "", false
+		}
+	}
+	switch {
+	case len(parts) == 2:
 		return "https://github.com/" + parts[0] + "/" + parts[1] + ".git", true
+	case len(parts) == 3 && strings.Contains(parts[0], ".") && !strings.HasPrefix(parts[0], "."):
+		// host/owner/repo for GitLab, Codeberg, Gitea, Forgejo and friends.
+		return "https://" + parts[0] + "/" + parts[1] + "/" + parts[2] + ".git", true
 	}
 	return "", false
+}
+
+// sidecarRefspecs fetch the attribution refs that other tools keep outside
+// branches: git-ai notes and authorship refs, Entire checkpoints, Exceeds
+// Ink and Claudit notes. Servers without them return nothing, which is fine.
+var sidecarRefspecs = []string{
+	"+refs/notes/*:refs/notes/*",
+	"+refs/ai/*:refs/ai/*",
+	"+refs/entire/*:refs/entire/*",
+	"+refs/heads/entire/checkpoints/*:refs/remotes/origin/entire/checkpoints/*",
+}
+
+func fetchSidecars(ctx context.Context, r *gitx.Runner) {
+	args := append([]string{"fetch", "--quiet", "origin"}, sidecarRefspecs...)
+	_, _ = r.Run(ctx, args...) // best effort: a report never fails on this
 }
 
 // cloneToCache clones url into the user cache (or refreshes an existing
@@ -361,6 +396,7 @@ func cloneToCache(ctx context.Context, url string, env Env, quiet bool) (string,
 				return dir, []string{fmt.Sprintf("could not move cached clone to %s (%v); results may be stale", ref, shortErr(err))}, nil
 			}
 		}
+		fetchSidecars(ctx, r)
 		return dir, nil, nil
 	}
 	if !quiet {
@@ -372,6 +408,7 @@ func cloneToCache(ctx context.Context, url string, env Env, quiet bool) (string,
 	if _, err := r.Run(ctx, "-c", "protocol.ext.allow=never", "clone", "--quiet", "--", url, dir); err != nil {
 		return "", nil, err
 	}
+	fetchSidecars(ctx, &gitx.Runner{Dir: dir})
 	return dir, nil, nil
 }
 
@@ -458,6 +495,8 @@ func buildAnalyzer(c *common, r *gitx.Runner, env Env, blame bool) (*stats.Analy
 		MaxFileSize:      c.maxFileSize,
 		Jobs:             c.jobs,
 		IncludeMerges:    c.includeMerges,
+		Provenance:       !c.noProvenance && cfg.Detect.ProvenanceEnabled(),
+		NoAuthors:        c.noAuthors,
 		Top:              c.top,
 		PathDepth:        c.depth,
 		Version:          Version,
@@ -468,10 +507,12 @@ func buildAnalyzer(c *common, r *gitx.Runner, env Env, blame bool) (*stats.Analy
 	if blame && !c.quiet && isTTY(env.Stderr) {
 		opts.Progress = progressPrinter(env.Stderr)
 	}
+	copts := cfg.ClassifierOptions()
 	return &stats.Analyzer{
-		Runner:     r,
-		Classifier: attrib.NewClassifier(cfg.ClassifierOptions()),
-		Opts:       opts,
+		Runner:      r,
+		Classifier:  attrib.NewClassifier(copts),
+		Opts:        opts,
+		ExtraAgents: copts.ExtraAgents,
 	}, cfg, nil
 }
 

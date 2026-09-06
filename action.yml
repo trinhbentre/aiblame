@@ -30,8 +30,19 @@ inputs:
   check-args:
     description: >-
       If set, run `aiblame check` with these flags and fail the job when a rule
-      fails (e.g. "--max 60 --require-trailer assisted-by").
+      fails (e.g. "--max 60 --require-trailer assisted-by" or "--policy kernel").
     default: ""
+  pr-range:
+    description: >-
+      On pull_request events, analyse only the PR's commits
+      (--rev origin/<base>..HEAD) so the report and the check describe this
+      change rather than the whole repository.
+    default: "false"
+  pr-comment:
+    description: >-
+      On pull_request events, post (or update) a comment on the PR with the
+      Markdown report. Needs `permissions: pull-requests: write`.
+    default: "false"
 
 outputs:
   ai-share:
@@ -89,25 +100,67 @@ runs:
 
     # Inputs are passed through `env:` and expanded by the shell, never
     # interpolated into the script text, so they cannot inject commands.
+    - name: Resolve PR range
+      id: range
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      env:
+        AIBLAME_PR_RANGE: ${{ inputs.pr-range }}
+        AIBLAME_BASE_REF: ${{ github.base_ref }}
+      run: |
+        set -euo pipefail
+        range=""
+        if [ "$AIBLAME_PR_RANGE" = "true" ] && [ -n "$AIBLAME_BASE_REF" ]; then
+          git fetch --quiet origin -- "$AIBLAME_BASE_REF" || true
+          range="--rev origin/$AIBLAME_BASE_REF..HEAD"
+          echo "Analysing only this pull request: $range"
+        fi
+        echo "flag=$range" >> "$GITHUB_OUTPUT"
+
     - name: Report
       id: report
       shell: bash
       working-directory: ${{ inputs.path }}
       env:
         AIBLAME_ARGS: ${{ inputs.args }}
+        AIBLAME_RANGE: ${{ steps.range.outputs.flag }}
         AIBLAME_SUMMARY: ${{ inputs.summary }}
       run: |
         set -euo pipefail
         report="$RUNNER_TEMP/aiblame-report.json"
+        md="$RUNNER_TEMP/aiblame-report.md"
         # shellcheck disable=SC2086
-        aiblame stats . --json --quiet $AIBLAME_ARGS > "$report"
+        aiblame stats . --json --quiet $AIBLAME_RANGE $AIBLAME_ARGS > "$report"
         share=$(jq -r '.headline_ai_share' "$report")
         printf 'ai-share=%.1f\n' "$share" >> "$GITHUB_OUTPUT"
         echo "report=$report" >> "$GITHUB_OUTPUT"
+        echo "markdown=$md" >> "$GITHUB_OUTPUT"
         echo "AI share: ${share}%"
+        # shellcheck disable=SC2086
+        aiblame stats . -f md --quiet $AIBLAME_RANGE $AIBLAME_ARGS > "$md"
         if [ "$AIBLAME_SUMMARY" = "true" ]; then
-          # shellcheck disable=SC2086
-          aiblame stats . -f md --quiet $AIBLAME_ARGS >> "$GITHUB_STEP_SUMMARY"
+          cat "$md" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Comment on the pull request
+      if: inputs.pr-comment == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+        AIBLAME_MD: ${{ steps.report.outputs.markdown }}
+        AIBLAME_PR: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+        marker="<!-- aiblame-report -->"
+        { echo "$marker"; cat "$AIBLAME_MD"; } > "$RUNNER_TEMP/aiblame-comment.md"
+        # Update the previous aiblame comment when there is one, else create it.
+        existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$AIBLAME_PR/comments" --paginate \
+          --jq "[.[] | select(.body | startswith(\"$marker\"))][0].id" 2>/dev/null || true)
+        if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" -F body=@"$RUNNER_TEMP/aiblame-comment.md" > /dev/null
+        else
+          gh pr comment "$AIBLAME_PR" --body-file "$RUNNER_TEMP/aiblame-comment.md"
         fi
 
     - name: Badge
@@ -129,7 +182,8 @@ runs:
       working-directory: ${{ inputs.path }}
       env:
         AIBLAME_CHECK_ARGS: ${{ inputs.check-args }}
+        AIBLAME_RANGE: ${{ steps.range.outputs.flag }}
       run: |
         set -euo pipefail
         # shellcheck disable=SC2086
-        aiblame check . --no-color --quiet $AIBLAME_CHECK_ARGS
+        aiblame check . --no-color --quiet $AIBLAME_RANGE $AIBLAME_CHECK_ARGS

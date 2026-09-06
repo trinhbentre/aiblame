@@ -75,6 +75,26 @@ type AgentStat struct {
 	Churn   int64    `json:"churn"`
 	Lines   int64    `json:"lines"`
 	Models  []string `json:"models,omitempty"`
+	// Survival is Lines / Churn as a percentage: how much of what the agent
+	// added is still in the tree. Nil when blame did not run, a time window
+	// was set, or the agent added nothing.
+	Survival *float64 `json:"survival,omitempty"`
+}
+
+// Survival is the share of added lines that still survive at the analysed
+// revision, per kind. It follows the "line survival" metric of Rahman &
+// Shihab (EASE 2026) and GitClear's churn work: added lines are taken from
+// the whole history (git log --numstat), surviving lines from git blame.
+type Survival struct {
+	AI    float64 `json:"ai"`
+	Human float64 `json:"human"`
+	All   float64 `json:"all"`
+}
+
+// NameCount is a generic (name, commits) row.
+type NameCount struct {
+	Name    string `json:"name"`
+	Commits int64  `json:"commits"`
 }
 
 // AuthorStat describes a human contributor and how much of their work was
@@ -121,13 +141,16 @@ type ConventionStat struct {
 
 // Report is the full analysis result. Field names are stable across 1.x.
 type Report struct {
-	Tool        string    `json:"tool"`
-	Version     string    `json:"version"`
-	SchemaVer   int       `json:"schema_version"`
-	Repo        string    `json:"repo"`
-	Remote      string    `json:"remote,omitempty"`
-	RevName     string    `json:"rev"`
-	Rev         string    `json:"rev_hash"`
+	Tool      string `json:"tool"`
+	Version   string `json:"version"`
+	SchemaVer int    `json:"schema_version"`
+	Repo      string `json:"repo"`
+	Remote    string `json:"remote,omitempty"`
+	RevName   string `json:"rev"`
+	Rev       string `json:"rev_hash"`
+	// BaseRev is set in range mode ("--rev main..HEAD"): commits, churn and
+	// surviving lines then cover only what the range introduced.
+	BaseRev     string    `json:"base_rev,omitempty"`
 	GeneratedAt time.Time `json:"generated_at"`
 
 	// Metric names the headline: "lines" (surviving lines from blame) or
@@ -145,6 +168,20 @@ type Report struct {
 	Dirs        []PathStat       `json:"dirs"`
 	Files       []PathStat       `json:"files"`
 	Months      []MonthStat      `json:"months"`
+
+	// Survival is present when blame ran without a time window.
+	Survival *Survival `json:"survival,omitempty"`
+	// Provenance lists the sidecar sources read (git-ai notes, Entire
+	// checkpoints, …) with the number of commits each covered.
+	Provenance []NameCount `json:"provenance"`
+	// LineLevelCommits is the number of commits whose surviving lines were
+	// attributed line by line from an authorship log instead of inheriting
+	// the commit's kind.
+	LineLevelCommits int `json:"line_level_commits"`
+	// Unrecognised lists tool names found in Generated-by / Made-with
+	// trailers that aiblame did not count because it does not know them as
+	// AI agents. Add them under [[detect.agents]] if they are.
+	Unrecognised []NameCount `json:"unrecognised_tools"`
 
 	FileCount    int      `json:"file_count"`
 	SkippedFiles int      `json:"skipped_files"`
